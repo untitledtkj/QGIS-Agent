@@ -1,0 +1,21 @@
+[project]
+name = "qgis-agentv2"
+version = "0.1.0"
+description = "QGISMCP connects QGIS to AI agents through the Model Context Protocol (MCP)."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.0.0",           # Model Context Protocol SDK
+    "uvicorn>=0.30.0",      # ASGI server for mcp_server.py
+    "starlette>=0.37.0",    # Web framework used in mcp_server.py
+    "sse-starlette>=2.1.0", # SSE support for HTTP transport
+    "requests>=2.32.0",     # Used in extract_method_by_name.py
+    "beautifulsoup4>=4.12.0", # Used for parsing docs in extract_method_by_name.py
+    "anyio>=4.4.0",         # Async I/O used in mcp_server.py
+]
+
+# 配置 uv 使用清华及其他国内镜像源
+[[tool.uv.index]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
