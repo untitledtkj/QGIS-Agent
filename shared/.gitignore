@@ -1,0 +1,16 @@
+# 忽略上传的文件（示例数据）
+uploads/*/original/*
+uploads/*/processed/*
+
+# 保留输出文件
+!outputs/*/.gitkeep
+
+# 忽略截图文件（可选，如果不想提交）
+screenshots/*/*
+
+# 忽略日志文件
+logs/*.log
+
+# 忽略临时文件
+*.tmp
+*.bak
