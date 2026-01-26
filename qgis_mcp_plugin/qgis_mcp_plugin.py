@@ -148,6 +148,7 @@ class QgisMCPServer(QObject):
                 "save_project": self.save_project,
                 "render_map": self.render_map,
                 "create_new_project": self.create_new_project,
+                "capture_map_canvas": self.capture_map_canvas,
             }
             
             handler = handlers.get(cmd_type)
@@ -513,6 +514,55 @@ class QgisMCPServer(QObject):
                 
         except Exception as e:
             raise Exception(f"Render error: {str(e)}")
+    
+    def capture_map_canvas(self, path, width=800, height=600, **kwargs):
+        """
+        Capture the current QGIS map canvas to an image file.
+        
+        Args:
+            path: Full path to save the screenshot image (e.g., '/path/to/screenshot.png')
+            width: Image width in pixels (default: 800)
+            height: Image height in pixels (default: 600)
+            
+        Returns:
+            dict: Result with success status and file path
+        """
+        try:
+            # 获取当前画布
+            canvas = self.iface.mapCanvas()
+            
+            # 保存当前尺寸以便恢复
+            original_size = canvas.size()
+            
+            # 设置尺寸
+            if width > 0 and height > 0:
+                canvas.resize(width, height)
+            
+            # 确保目录存在
+            directory = os.path.dirname(path)
+            if directory and not os.path.exists(directory):
+                os.makedirs(directory, exist_ok=True)
+            
+            # 保存截图
+            canvas.saveAsImage(path)
+            
+            # 恢复原始尺寸
+            canvas.resize(original_size)
+            
+            return {
+                "success": True,
+                "path": path,
+                "width": width,
+                "height": height,
+                "message": f"Screenshot saved to {path}"
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "traceback": traceback.format_exc()
+            }
 
 
 class QgisMCPDockWidget(QDockWidget):

@@ -260,6 +260,28 @@ def execute_code(ctx: Context, code: str) -> str:
     return json.dumps(result, indent=2)
 
 
+@mcp.tool()
+def capture_map_canvas(ctx: Context, path: str, width: int = 800, height: int = 600) -> str:
+    """
+    Capture the current QGIS map canvas to an image file.
+    
+    Args:
+        path: Full path to save the screenshot image (e.g., 'C:/shared/screenshots/session_id/map_canvas_1234567890.png')
+        width: Image width in pixels (default: 800)
+        height: Image height in pixels (default: 600)
+    
+    Returns:
+        JSON string with success status and file path
+    """
+    qgis = get_qgis_connection()
+    result = qgis.send_command("capture_map_canvas", {
+        "path": path,
+        "width": width,
+        "height": height
+    })
+    return json.dumps(result, indent=2)
+
+
 
 def main():
     """Run the MCP server"""
