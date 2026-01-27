@@ -132,14 +132,18 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     quality_score = 0.0
     
     if is_success:
-        # 成功任务基础分 0.6
-        quality_score = 0.6
+        # 成功任务基础分 0.5
+        quality_score = 0.5
         
-        # 根据复杂度加分
+        # 根据复杂度加分（确保2步以上都能>0.6）
         if total_steps >= 5:
-            quality_score += 0.2
+            quality_score += 0.3
         elif total_steps >= 3:
-            quality_score += 0.1
+            quality_score += 0.2
+        elif total_steps >= 2:
+            quality_score += 0.15
+        elif total_steps >= 1:
+            quality_score += 0.12
         
         # 如果有重试但最终成功，加分（说明有纠错能力）
         if error_count > 0:
@@ -152,8 +156,8 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     
     logger.info(f"质量评分: {quality_score:.2f}")
     
-    # 4. 归档到Cookbook（仅成功任务且质量评分>=0.7）
-    if is_success and quality_score >= 0.7:
+    # 4. 归档到Cookbook（仅成功任务且质量评分>0.6）
+    if is_success and quality_score > 0.6:
         logger.info("任务质量达标，归档到Cookbook...")
         
         # 合并所有成功步骤的代码
@@ -176,6 +180,14 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
         # 计算复杂度评分
         complexity_score = min(total_steps / 10.0, 1.0)
         
+        # 准备步骤信息（保存到steps字段）
+        steps_info = {
+            "session_id": session_id,
+            "total_steps": total_steps,
+            "quality_score": quality_score,
+            "plan_task": plan.task if plan else None,
+        }
+        
         # 保存到Cookbook
         try:
             entry_id = save_cookbook_entry(
@@ -183,11 +195,7 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
                 verified_code=verified_code,
                 tags=tags,
                 complexity_score=complexity_score,
-                metadata={
-                    "session_id": session_id,
-                    "total_steps": total_steps,
-                    "quality_score": quality_score,
-                }
+                steps=steps_info
             )
             
             if entry_id:
@@ -205,7 +213,7 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
             logger.error(f"归档到Cookbook时发生异常: {e}")
     
     else:
-        logger.info(f"任务不满足归档条件 (成功={is_success}, 质量={quality_score:.2f})")
+        logger.info(f"任务不满足归档条件 (成功={is_success}, 质量={quality_score:.2f}, 需要>0.6)")
     
     # 5. 生成截图（如果任务成功）
     screenshot_path = None
