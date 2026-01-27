@@ -20,6 +20,12 @@ dependencies = [
     # 环境变量
     "python-dotenv>=1.0.0", # 环境变量管理
     "aiohttp>=3.13.3",
+    "langgraph>=1.0.7",
+    "langchain>=1.2.7",
+    "langchain-openai>=1.1.7",
+    "langchain-core>=1.2.7",
+    "pydantic>=2.12.5",
+    "pytest>=8.0.0",
 ]
 
 # 配置 uv 使用清华及其他国内镜像源
