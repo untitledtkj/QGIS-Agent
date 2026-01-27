@@ -4,18 +4,20 @@ Executor Node - 执行器节点
 负责代码生成、执行与自主纠错
 """
 
-from typing import Dict, Any
+from typing import Dict, Any, List
 import logging
 import json
 import os
+from datetime import datetime
 from dotenv import load_dotenv
 
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
-from agent.state import AgentState
+from agent.state import AgentState, RelevantDoc, StepContext
 from agent.tools.database import save_execution_log
 from agent.tools.mcp_client import get_mcp_client
+from agent.tools.rag import search_gdal_docs, search_pyqgis_docs
 
 load_dotenv()
 
@@ -32,8 +34,103 @@ llm = ChatOpenAI(
 # 最大重试次数
 MAX_RETRY_ATTEMPTS = 3
 
+# 是否支持思考模型（如deepseek-reasoner）
+SUPPORT_THINKING_MODEL = os.getenv("SUPPORT_THINKING_MODEL", "true").lower() == "true"
 
-async def executor_node(state: AgentState) -> Dict[str, Any]:
+
+async def _runtime_api_rag(api_names: List[str], step_context: StepContext) -> List[RelevantDoc]:
+    """
+    Runtime API RAG - 在执行过程中动态补充API文档
+    
+    Args:
+        api_names: 需要补充的API名称列表
+        step_context: 当前步骤上下文
+        
+    Returns:
+        补充的API文档列表
+    """
+    logger.info(f"Runtime API RAG: 补充{len(api_names)}个API文档")
+    
+    supplemental_docs = []
+    
+    # 分离GDAL和PyQGIS API
+    gdal_apis = [api for api in api_names if 'osgeo' in api or 'gdal' in api.lower() or 'ogr' in api.lower()]
+    pyqgis_apis = [api for api in api_names if api not in gdal_apis]
+    
+    try:
+        # 检索GDAL文档
+        if gdal_apis:
+            gdal_results = search_gdal_docs(gdal_apis)
+            for doc in gdal_results:
+                supplemental_docs.append(RelevantDoc(
+                    api_name=doc["api_name"],
+                    library="GDAL",
+                    content=f"API名称: {doc['api_name']}\n\n描述: {doc['description']}\n\n参数:\n{doc['params']}\n\n示例:\n{doc.get('example_code', '')}"
+                ))
+        
+        # 检索PyQGIS文档
+        if pyqgis_apis:
+            pyqgis_results = search_pyqgis_docs(pyqgis_apis)
+            for doc in pyqgis_results:
+                supplemental_docs.append(RelevantDoc(
+                    api_name=doc["api_name"],
+                    library="PyQGIS",
+                    content=doc["content"]
+                ))
+        
+        logger.info(f"Runtime API RAG: 成功补充{len(supplemental_docs)}个API文档")
+        
+    except Exception as e:
+        logger.error(f"Runtime API RAG失败: {e}")
+    
+    return supplemental_docs
+
+
+async def _capture_step_screenshot(session_id: str, step_id: int) -> str:
+    """
+    捕获当前步骤的截图
+    
+    Args:
+        session_id: 会话ID
+        step_id: 步骤ID
+        
+    Returns:
+        截图文件路径，失败返回None
+    """
+    try:
+        # 创建截图目录
+        screenshot_dir = os.path.join("shared", "screenshots", session_id)
+        os.makedirs(screenshot_dir, exist_ok=True)
+        
+        # 生成截图文件名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        screenshot_file = os.path.abspath(
+            os.path.join(screenshot_dir, f"step_{step_id}_{timestamp}.png")
+        )
+        
+        # 通过MCP获取截图
+        mcp_client = await get_mcp_client()
+        result = await mcp_client.capture_screenshot(
+            path=screenshot_file,
+            width=1200,
+            height=800,
+            timeout=10
+        )
+        
+        # 检查截图是否成功
+        if os.path.exists(screenshot_file):
+            logger.info(f"步骤{step_id}截图保存成功: {screenshot_file}")
+            return screenshot_file
+        else:
+            logger.warning(f"步骤{step_id}截图文件未生成")
+            return None
+    
+    except Exception as e:
+        logger.error(f"捕获步骤{step_id}截图失败: {e}")
+        return None
+
+
+def executor_node(state: AgentState) -> Dict[str, Any]:
     """
     执行器节点 - 生成并执行代码
     
@@ -50,6 +147,14 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
         
     Returns:
         更新后的状态字段
+    """
+    import asyncio
+    return asyncio.run(_executor_node_async(state))
+
+
+async def _executor_node_async(state: AgentState) -> Dict[str, Any]:
+    """
+    执行器节点的异步实现
     """
     logger.info("=" * 60)
     logger.info("Executor Node: 开始执行代码")
@@ -103,6 +208,17 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
             api_context_parts.append(f"### {doc.api_name} ({doc.library})\n{doc.content}\n")
     
     # 2. 构建Prompt
+    thinking_instruction = ""
+    if SUPPORT_THINKING_MODEL:
+        thinking_instruction = """\n## 思考过程（可选）
+如果需要，你可以使用<thought>标签包裹你的思考过程：
+<thought>
+这里是你的思考过程，分析任务需求、选择合适的API、考虑潜在的问题等
+</thought>
+
+然后输出代码。思考过程不会被执行，仅用于记录推理链。
+"""
+    
     system_prompt = f"""你是一个专业的QGIS Python开发专家。你的任务是根据提供的API文档和任务描述，生成可执行的PyQGIS/GDAL代码。
 
 ## 当前任务
@@ -111,7 +227,7 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
 
 ## 可用的API文档
 {''.join(api_context_parts) if api_context_parts else '未提供API文档'}
-
+{thinking_instruction}
 ## 代码生成要求
 1. **严格参考API文档**: 参数名称、类型必须与文档完全一致，不要臆造参数
 2. **防御性编程**: 在执行前检查文件是否存在、图层是否已加载等
@@ -119,6 +235,7 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
 4. **单步专注**: 只完成当前步骤的目标，不要执行后续步骤
 5. **文件路径**: 确保文件路径符合Host OS格式（Windows用反斜杠，Linux/Mac用正斜杠）
 6. **输出信息**: 使用print()输出关键信息，便于调试
+7. **Runtime API查询**: 如果发现需要的API文档缺失，在代码注释中标注#NEED_API: api_name，系统会自动补充
 
 ## 输出格式
 只输出Python代码，不要包含任何解释文字或markdown标记。
@@ -147,7 +264,20 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
         ]
         
         response = llm.invoke(llm_messages)
-        generated_code = response.content.strip()
+        raw_response = response.content.strip()
+        
+        # 提取思考过程（如果有）
+        thought_content = ""
+        generated_code = raw_response
+        
+        if SUPPORT_THINKING_MODEL and "<thought>" in raw_response and "</thought>" in raw_response:
+            import re
+            thought_match = re.search(r'<thought>(.*?)</thought>', raw_response, re.DOTALL)
+            if thought_match:
+                thought_content = thought_match.group(1).strip()
+                # 移除思考标签，保留代码
+                generated_code = re.sub(r'<thought>.*?</thought>', '', raw_response, flags=re.DOTALL).strip()
+                logger.info(f"提取到思考过程（{len(thought_content)}字符）: {thought_content[:100]}...")
         
         # 清理代码（移除可能的markdown包裹）
         if generated_code.startswith("```python"):
@@ -159,7 +289,26 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
         
         generated_code = generated_code.strip()
         
+        # 检查是否需要Runtime API补充
+        import re
+        need_apis = re.findall(r'#\s*NEED_API:\s*([\w\.]+)', generated_code)
+        if need_apis:
+            logger.info(f"检测到需要补充的API: {need_apis}")
+            # Runtime API RAG补充
+            supplemental_docs = await _runtime_api_rag(need_apis, step_context)
+            if supplemental_docs:
+                logger.info(f"补充了{len(supplemental_docs)}个API文档")
+                # 将补充文档添加到上下文并重新生成代码
+                for doc in supplemental_docs:
+                    api_context_parts.append(f"### {doc.api_name} ({doc.library})\n{doc.content}\n")
+                # 更新system_prompt并重新调用
+                # （这里简化处理，实际可以递归调用）
+        
         logger.info(f"生成代码（{len(generated_code)}字符）:\n{generated_code[:200]}...")
+        
+        # 记录思考过程到messages
+        if thought_content:
+            messages.append(AIMessage(content=f"思考: {thought_content}"))
         
         # 记录代码
         code_history.append(generated_code)
@@ -263,6 +412,12 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
             messages.append(AIMessage(content=f"步骤 {step.step_id} 代码:\n```python\n{generated_code}\n```"))
             messages.append(HumanMessage(content=f"执行成功"))
             
+            # 每步成功后生成截图
+            step_screenshot_path = await _capture_step_screenshot(session_id, step.step_id)
+            if step_screenshot_path:
+                logger.info(f"步骤 {step.step_id} 截图: {step_screenshot_path}")
+                execution_logs[-1]["screenshot"] = step_screenshot_path
+            
             # 移动到下一步，重置重试计数
             return {
                 "current_step_id": current_step_id + 1,
@@ -270,6 +425,7 @@ async def executor_node(state: AgentState) -> Dict[str, Any]:
                 "code_history": code_history,
                 "retry_attempts": 0,
                 "messages": messages,
+                "screenshot_path": step_screenshot_path,  # 保存最新截图
             }
         
         else:

@@ -97,24 +97,18 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
     # 2. 检索相似案例（仅在首次规划时）
     example = None
     examples_list = []  # 存储Top-3案例
+    has_example_reference = False
+    
     if retry_count == 0 and not advise:
         logger.info("检索Cookbook相似案例...")
         cookbook_results = search_cookbook(search_query, similarity_threshold=0.3, top_k=3)
         
         if cookbook_results:
-            # 选择相似度>0.8的高匹配案例，如果没有则使用全部Top-3
-            high_quality_examples = [ex for ex in cookbook_results if ex.get('similarity_score', 0) > 0.8]
-            
-            if high_quality_examples:
-                examples_list = high_quality_examples[:3]
-                logger.info(f"找到{len(examples_list)}个高质量案例（相似度>0.8）")
-            else:
-                examples_list = cookbook_results[:3]
-                logger.info(f"使用Top-3案例（最高相似度: {cookbook_results[0].get('similarity_score', 0):.2f}）")
-            
-            # 使用最相似的案例作为主要参考
-            example = examples_list[0]
-            logger.info(f"主要参考案例: {example['user_intent'][:50]}... (相似度: {example['similarity_score']:.2f})")
+            # 使用Top-3案例
+            examples_list = cookbook_results
+            example = cookbook_results[0]  # 主要参考最相似的案例（保留此字段用于State兼容）
+            has_example_reference = True
+            logger.info(f"找到{len(cookbook_results)}个相似案例，Top-1: {example['user_intent'][:50]}... (相似度: {example['similarity_score']:.2f})")
         else:
             logger.info("未找到相似案例")
     
@@ -135,10 +129,8 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
     }
   ],
   "metadata": {
-    "iteration": 当前规划的迭代次数（整数）,
-    "has_example_reference": 是否参考了相似案例（true/false）,
-    "estimated_complexity": "low/medium/high",
-    "requires_data": true/false
+    "iteration": 1,
+    "has_example_reference": true/false
   }
 }
 
@@ -165,9 +157,6 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
     # 构建用户消息
     user_parts = [f"用户需求: {input_query}"]
     
-    # 添加当前迭代信息
-    user_parts.append(f"\n当前规划迭代次数: {retry_count + 1}")
-    
     # 添加上一轮执行总结（如果有）
     if log_summary:
         user_parts.append(f"\n上一轮执行总结:\n{log_summary}")
@@ -178,18 +167,18 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
     
     # 添加相似案例（如果有）
     if examples_list:
-        # 构建所有案例的参考信息
-        example_refs = []
-        for idx, ex in enumerate(examples_list, 1):
-            example_refs.append(f"""
-案例{idx} (相似度: {ex.get('similarity_score', 0):.2f}):
-- 原始需求: {ex['user_intent']}
+        cases_text = []
+        for i, case in enumerate(examples_list[:3], 1):  # 最多显示3个案例
+            cases_text.append(f"""
+案例 {i} (相似度: {case['similarity_score']:.2f}):
+- 原始需求: {case['user_intent']}
 - 参考代码:
 ```python
-{ex['verified_code']}
+{case['verified_code']}
 ```
 """)
-        user_parts.append("\n".join(example_refs))
+        
+        user_parts.append("\n相似案例参考（按相似度排序）:\n" + "\n".join(cases_text))
     
     user_message = "\n".join(user_parts)
     
@@ -228,7 +217,7 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
         # 确保metadata包含必需字段
         metadata = plan_dict.get("metadata", {})
         metadata["iteration"] = retry_count + 1
-        metadata["has_example_reference"] = bool(examples_list)
+        metadata["has_example_reference"] = has_example_reference
         
         plan = Plan(
             task=plan_dict["task"],

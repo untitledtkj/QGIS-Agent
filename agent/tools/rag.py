@@ -103,15 +103,18 @@ def search_gdal_docs_fuzzy(query: str, limit: int = 10) -> List[Dict[str, Any]]:
 
 def search_cookbook(
     user_intent: str,
-    similarity_threshold: float = 0.3,
+    similarity_threshold: float = 0.8,  # 提高到0.8以获得更高质量的匹配
     top_k: int = 3
 ) -> List[Dict[str, Any]]:
     """
     在Cookbook中搜索相似案例
     
+    使用BM25+Vector混合检索策略（当前版本使用pg_trgm相似度）
+    未来可扩展为真正的混合检索
+    
     Args:
         user_intent: 用户意图描述
-        similarity_threshold: 相似度阈值 (0.0-1.0)
+        similarity_threshold: 相似度阈值 (0.0-1.0)，技术文档建议>0.8
         top_k: 返回top k个结果
         
     Returns:
@@ -124,6 +127,7 @@ def search_cookbook(
         with pool.connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
                 # 使用pg_trgm的相似度搜索
+                # TODO: 未来可扩展为BM25 + Vector混合检索
                 cur.execute(
                     """
                     SELECT id, user_intent, verified_code, tags, 
@@ -137,7 +141,26 @@ def search_cookbook(
                     (user_intent, user_intent, similarity_threshold, user_intent, top_k)
                 )
                 results = cur.fetchall()
-                logger.info(f"搜索Cookbook: 找到{len(results)}个相似案例")
+                logger.info(f"搜索Cookbook: 找到{len(results)}个相似案例（阈值>{similarity_threshold}）")
+                
+                # 如果高阈值没有结果，尝试降低阈值
+                if not results and similarity_threshold > 0.3:
+                    logger.info(f"高阈值无结果，尝试降低阈值到0.3重新搜索...")
+                    cur.execute(
+                        """
+                        SELECT id, user_intent, verified_code, tags, 
+                               complexity_score, steps, usage_count,
+                               similarity(user_intent, %s) as similarity_score
+                        FROM cookbook
+                        WHERE similarity(user_intent, %s) > 0.3
+                        ORDER BY similarity(user_intent, %s) DESC
+                        LIMIT %s
+                        """,
+                        (user_intent, user_intent, user_intent, top_k)
+                    )
+                    results = cur.fetchall()
+                    logger.info(f"降低阈值后找到{len(results)}个相似案例")
+                
                 return results
     except Exception as e:
         logger.error(f"搜索Cookbook失败: {e}")
@@ -159,6 +182,16 @@ def search_pyqgis_docs(method_names: List[str]) -> List[Dict[str, Any]]:
     
     try:
         logger.info(f"通过MCP搜索PyQGIS文档: {method_names}")
+        
+        # 尝试获取运行中的事件循环
+        try:
+            loop = asyncio.get_running_loop()
+            # 如果有运行中的循环，使用nest_asyncio让我们可以嵌套运行
+            import nest_asyncio
+            nest_asyncio.apply()
+        except RuntimeError:
+            # 没有运行中的循环，正常继续
+            pass
         
         # 使用asyncio运行异步MCP调用
         return asyncio.run(_search_pyqgis_docs_async(method_names))
