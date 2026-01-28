@@ -28,6 +28,7 @@ dependencies = [
     "langchain-core>=1.2.7",
     "pydantic>=2.12.5",
     "pytest>=8.0.0",
+    "langchain-mcp-adapters>=0.2.1",
 ]
 
 # 配置 uv 使用清华及其他国内镜像源

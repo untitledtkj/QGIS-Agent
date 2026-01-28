@@ -266,11 +266,9 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
             
             # 通过MCP获取截图
             mcp_client = await get_mcp_client()
-            result = await mcp_client.capture_screenshot(
-                path=screenshot_file,
-                width=1200,
-                height=800,
-                timeout=30
+            await mcp_client.call_tool(
+                "capture_map_canvas",
+                {"path": screenshot_file, "width": 1200, "height": 800}
             )
             
             # 检查截图是否成功

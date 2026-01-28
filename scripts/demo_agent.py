@@ -99,14 +99,14 @@ def run_agent(user_query: str):
     print("="*60)
     print(f"\n用户查询: {user_query}\n")
     
-    # 1. 构建Graph（启用checkpointer支持HITL，在API RAG前中断）
+    # 1. 构建Graph（启用checkpointer支持HITL）
     print("1. 构建Graph...")
     try:
         app = get_graph(
             with_checkpointer=True,
-            interrupt_before=["api_rag_node"]  # 在Planner完成后暂停
+            reset_thread_id="demo_thread"
         )
-        print("   ✅ Graph构建成功（已启用状态持久化）\n")
+        print("   ✅ Graph构建成功（已启用状态持久化和人工审核）\n")
     except Exception as e:
         print(f"   ❌ Graph构建失败: {e}")
         print("\n提示: 请确保PostgreSQL数据库正在运行")
@@ -120,22 +120,6 @@ def run_agent(user_query: str):
     )
     print(f"   ✅ Session ID: {initial_state['session_id']}\n")
     
-    # 3. 准备执行
-    print("="*60)
-    print("准备执行Graph")
-    print("="*60)
-    print("\n注意: 完整执行需要:")
-    print("1. ✅ OPENAI_API_KEY环境变量已设置")
-    print("2. ✅ PostgreSQL数据库正在运行（localhost:5432）")
-    print("3. ⚠️  QGIS MCP服务器正在运行（localhost:8080）")
-    print("4. ⚠️  GDAL文档已导入到数据库")
-    print("\n如果缺少任何依赖，执行将会失败。")
-    
-    user_input = input("\n是否继续执行? (y/N): ")
-    
-    if user_input.lower() != 'y':
-        print("\n取消执行")
-        return
     
     # 4. 执行Graph（支持HITL）
     print("\n" + "="*60)
@@ -149,108 +133,85 @@ def run_agent(user_query: str):
     }
     
     try:
-        # 执行流程
+        # 执行流程：Graph会自动管理人工审核流程
         print("🚀 开始执行...\n")
         
-        max_retries = 3
-        retry_count = 0
-        approved = False
         current_state = initial_state
+        last_step = -1
         
-        # 循环：生成计划 -> 审核 -> 批准或修改
-        while not approved and retry_count < max_retries:
-            # 1. 执行Planner（会在api_rag_node前中断）
+        # Stream执行，遇到人工审核节点时自动中断
+        while True:
             final_state = None
-            print(f"⚙️  规划中... (尝试 {retry_count + 1}/{max_retries})")
+            interrupted = False
             
             for chunk in app.stream(current_state, config, stream_mode="values"):
                 final_state = chunk
-                if chunk.get("draft"):
-                    print("✓ Planner生成draft完成")
-            
-            if not final_state or not final_state.get("draft"):
-                print("❌ Planner未生成计划")
-                return
-            
-            # 2. 展示并审核计划
-            print("\n⏸️  到达中断点：计划审核")
-            print_plan(final_state["draft"])
-            
-            approved, advise = review_plan()
-            
-            if advise is None and not approved:
-                # 用户选择放弃
-                print("\n任务已取消")
-                return
-            
-            if not approved:
-                # 用户要求修改，准备下一轮
-                print(f"\n📝 修改意见: {advise}")
-                retry_count += 1
                 
-                # 更新状态：设置修改意见，清空draft，重新回到Planner
-                app.update_state(
-                    config,
-                    {
-                        "advise": advise,
-                        "status": False,
-                        "retry_count": retry_count,
-                        "draft": None
-                    }
-                )
-                # 从checkpoint继续（从Planner开始）
+                # 显示Planner进度
+                if chunk.get("draft") and not chunk.get("plan"):
+                    print("✓ Planner生成draft完成")
+                
+                # 显示执行进度
+                if "current_step_id" in chunk:
+                    current_step = chunk["current_step_id"]
+                    if current_step != last_step:
+                        last_step = current_step
+                        plan = chunk.get("plan")
+                        if plan and current_step < len(plan.steps):
+                            print(f"⚙️  执行步骤 {current_step + 1}/{len(plan.steps)}: {plan.steps[current_step].description}")
+                
+                # 检查是否完成API RAG
+                if chunk.get("api_context_structured") and not interrupted:
+                    print("✓ API RAG节点完成")
+                
+                # 检查是否到达Reflector
+                if chunk.get("final_summary"):
+                    print("✓ Reflector节点完成")
+            
+            # 检查是否在human_review_node前中断
+            if final_state and final_state.get("draft") and not final_state.get("status", False):
+                interrupted = True
+                print("\n⏸️  到达中断点：计划审核")
+                print_plan(final_state["draft"])
+                
+                # 人工审核
+                approved, advise = review_plan()
+                
+                if advise is None and not approved:
+                    # 用户选择放弃
+                    print("\n任务已取消")
+                    return
+                
+                if approved:
+                    # 批准计划
+                    print("\n✅ 计划已批准\n")
+                    app.update_state(
+                        config,
+                        {
+                            "plan": final_state["draft"],
+                            "status": True
+                        }
+                    )
+                else:
+                    # 需要修改
+                    print(f"\n📝 修改意见: {advise}")
+                    retry_count = final_state.get("retry_count", 0)
+                    app.update_state(
+                        config,
+                        {
+                            "advise": advise,
+                            "status": False,
+                            "draft": None,
+                            "retry_count": retry_count + 1
+                        }
+                    )
+                    print("🔄 将根据意见重新规划...\n")
+                
+                # 继续执行
                 current_state = None
-                print("🔄 将根据意见重新规划...\n")
             else:
-                # 批准，准备执行
-                print("\n✅ 计划已批准\n")
-                # 更新状态：将draft提升为plan，设置status=True
-                app.update_state(
-                    config,
-                    {
-                        "plan": final_state["draft"],
-                        "status": True
-                    }
-                )
-        
-        # 检查是否超过重试次数
-        if not approved:
-            print(f"\n⚠️  已达到最大修改次数({max_retries})，使用最后一版计划继续执行\n")
-            app.update_state(
-                config,
-                {
-                    "plan": final_state.get("draft"),
-                    "status": True,
-                    "retry_count": max_retries
-                }
-            )
-        
-        # 3. 继续执行剩余节点（API RAG -> Executor -> Reflector）
-        print("🚀 开始执行任务...\n")
-        
-        final_state = None
-        last_step = -1
-        
-        # 从checkpoint继续（stream with None表示从当前中断点继续）
-        for chunk in app.stream(None, config, stream_mode="values"):
-            final_state = chunk
-            
-            # 显示执行进度
-            if "current_step_id" in chunk:
-                current_step = chunk["current_step_id"]
-                if current_step != last_step:
-                    last_step = current_step
-                    plan = chunk.get("plan")
-                    if plan and current_step < len(plan.steps):
-                        print(f"⚙️  执行步骤 {current_step + 1}/{len(plan.steps)}: {plan.steps[current_step].description}")
-            
-            # 检查是否完成API RAG
-            if chunk.get("api_context_structured"):
-                print("✓ API RAG节点完成")
-            
-            # 检查是否到达Reflector
-            if chunk.get("final_summary"):
-                print("✓ Reflector节点完成")
+                # 没有中断，执行完成
+                break
         
         # 显示最终结果
         if final_state:
@@ -278,14 +239,13 @@ def main():
     print("QGIS Agent Demo - HITL模式")
     print("="*60)
     print("\nGraph结构:")
-    print("  Planner → API RAG → Executor → Reflector")
+    print("  Planner → Human Review → API RAG → Executor → Reflector")
     print("\nHITL暂停点:")
-    print("  1️⃣  Planner审核 - 审核和修改执行计划")
-    print("  2️⃣  Reflector确认 - 查看执行结果")
+    print("  🔄 在Human Review节点前自动中断，等待人工审核")
     print("\n功能特性:")
-    print("  ✓ 人工审核计划")
+    print("  ✓ 人工审核计划（由Graph自动管理流程）")
     print("  ✓ 提供修改意见")
-    print("  ✓ 最多3次修改机会")
+    print("  ✓ 支持反复修改计划")
     print("  ✓ 实时执行进度显示")
     print("  ✓ 完整结果展示")
     print("="*60 + "\n")

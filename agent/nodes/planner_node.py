@@ -155,14 +155,16 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
   }
 }
 
-## API命名规范（重要）
+## API使用与命名规范（重要）
 请务必使用**完整的API名称格式**：
 
+GDAL API往往用于数据处理
 常用GDAL API示例：
 - 打开文件: osgeo.gdal.Open, osgeo.ogr.Open
 - 影像处理: osgeo.gdal.Warp, osgeo.gdal.Translate
 - 创建数据集: osgeo.gdal.GetDriverByName
 
+PyQGIS API往往用于QGIS内部的图层以及可视化操作
 常用PyQGIS API示例：
 - 图层操作: QgsVectorLayer, QgsRasterLayer
 - 项目管理: QgsProject
@@ -170,9 +172,9 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
 
 ## 注意事项
 1. 步骤不要拆分太细，每个步骤应该是中低复杂度的目标
-2. gdal_api和pyqgis_api列出所有可能用到的API名称（不需要参数细节）
-3. 参考相似案例可以提高准确性
-4. 如果有相似案例，尽量借鉴其代码逻辑
+2. 数据的导入与导出不需要使用GDAL或者PYQGIS的代码（因为有专门工具实现），只需在步骤中描述即可
+3. gdal_api和pyqgis_api列出所有可能用到的API名称（不需要参数细节），如果该步骤不需要使用某类API，可以留空
+4. 参考相似案例可以提高准确性
 """
     
     # 构建用户消息

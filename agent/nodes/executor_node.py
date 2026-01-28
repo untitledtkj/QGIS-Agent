@@ -4,7 +4,7 @@ Executor Node - 执行器节点
 负责代码生成、执行与自主纠错
 """
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 import logging
 import json
 import os
@@ -12,13 +12,15 @@ import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.tools import BaseTool, StructuredTool
 from langchain_openai import ChatOpenAI
+from pydantic import create_model, Field
 
 from agent.state import AgentState, RelevantDoc, StepContext
 from agent.tools.database import save_execution_log
 from agent.tools.mcp_client import get_mcp_client
-from agent.tools.rag import search_gdal_docs, search_pyqgis_docs
+from agent.tools.rag import search_gdal_docs, search_pyqgis_docs_async
 
 load_dotenv()
 
@@ -40,6 +42,117 @@ SUPPORT_THINKING_MODEL = os.getenv("SUPPORT_THINKING_MODEL", "true").lower() == 
 
 # 状态推送间隔（秒）
 STATUS_PUSH_INTERVAL = 5
+
+
+def _tool_result_to_text(result: Any) -> str:
+    """统一将工具返回结果转换为可读文本"""
+    if isinstance(result, str):
+        return result
+
+    if isinstance(result, ToolMessage):
+        content = getattr(result, "content", None)
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+            if text_parts:
+                return "\n".join(text_parts)
+        artifact = getattr(result, "artifact", None)
+        if isinstance(artifact, dict) and artifact.get("structured_content") is not None:
+            return json.dumps(artifact["structured_content"], ensure_ascii=False)
+
+    if isinstance(result, dict):
+        if "error" in result:
+            return json.dumps(result.get("error"), ensure_ascii=False)
+        if "content" in result:
+            content = result.get("content")
+            if isinstance(content, list):
+                text_parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                if text_parts:
+                    return "\n".join(text_parts)
+            if isinstance(content, str):
+                return content
+        return json.dumps(result, ensure_ascii=False)
+
+    try:
+        return json.dumps(result, ensure_ascii=False)
+    except TypeError:
+        return str(result)
+
+
+def _extract_tool_calls(message: AIMessage) -> List[Dict[str, Any]]:
+    tool_calls = getattr(message, "tool_calls", None)
+    if not tool_calls and getattr(message, "additional_kwargs", None):
+        tool_calls = message.additional_kwargs.get("tool_calls")
+    if not tool_calls:
+        return []
+
+    normalized: List[Dict[str, Any]] = []
+    for call in tool_calls:
+        if "name" in call and "args" in call:
+            normalized.append({
+                "id": call.get("id"),
+                "name": call.get("name"),
+                "args": call.get("args") or {},
+            })
+            continue
+        function_call = call.get("function", {}) if isinstance(call, dict) else {}
+        name = function_call.get("name")
+        arguments = function_call.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except Exception:
+                arguments = {"raw": arguments}
+        normalized.append({
+            "id": call.get("id"),
+            "name": name,
+            "args": arguments or {},
+        })
+    return normalized
+
+
+def _make_runtime_rag_tool(step_context: Optional[StepContext]):
+    # Runtime API RAG 暂时停用
+    async def _tool(api_names: List[str]) -> str:
+        return "Runtime API RAG 已停用"
+
+    def _tool_sync(**_):
+        raise RuntimeError("runtime_api_rag 已停用")
+
+    args_schema = create_model(
+        "RuntimeApiRagArgs",
+        api_names=(List[str], Field(..., description="需要补充的API名称列表")),
+    )
+
+    return StructuredTool.from_function(
+        name="runtime_api_rag",
+        description="运行时补充API文档（GDAL/PyQGIS）- 已停用",
+        func=_tool_sync,
+        coroutine=_tool,
+        args_schema=args_schema,
+    )
+
+
+async def _build_mcp_tools(step_context: Optional[StepContext]) -> Tuple[List[BaseTool], Dict[str, BaseTool], str]:
+    mcp_client = await get_mcp_client()
+    tools = await mcp_client.get_tools()
+
+    tool_map: Dict[str, BaseTool] = {tool.name: tool for tool in tools}
+    tool_lines: List[str] = []
+    for tool in tools:
+        description = getattr(tool, "description", "") or ""
+        tool_lines.append(f"- {tool.name}: {description or '无描述'}")
+
+    # Runtime API RAG 工具暂不注册
+
+    return tools, tool_map, "\n".join(tool_lines)
 
 
 async def _periodic_status_push(step_id: int, description: str, stop_event: asyncio.Event):
@@ -65,7 +178,7 @@ async def _periodic_status_push(step_id: int, description: str, stop_event: asyn
         # await sse_client.push_status(status_message)
 
 
-async def _runtime_api_rag(api_names: List[str], step_context: StepContext) -> List[RelevantDoc]:
+async def _runtime_api_rag(api_names: List[str], step_context: Optional[StepContext]) -> List[RelevantDoc]:
     """
     Runtime API RAG - 在执行过程中动态补充API文档
     
@@ -76,41 +189,9 @@ async def _runtime_api_rag(api_names: List[str], step_context: StepContext) -> L
     Returns:
         补充的API文档列表
     """
-    logger.info(f"Runtime API RAG: 补充{len(api_names)}个API文档")
-    
-    supplemental_docs = []
-    
-    # 分离GDAL和PyQGIS API
-    gdal_apis = [api for api in api_names if 'osgeo' in api or 'gdal' in api.lower() or 'ogr' in api.lower()]
-    pyqgis_apis = [api for api in api_names if api not in gdal_apis]
-    
-    try:
-        # 检索GDAL文档
-        if gdal_apis:
-            gdal_results = search_gdal_docs(gdal_apis)
-            for doc in gdal_results:
-                supplemental_docs.append(RelevantDoc(
-                    api_name=doc["api_name"],
-                    library="GDAL",
-                    content=f"API名称: {doc['api_name']}\n\n描述: {doc['description']}\n\n参数:\n{doc['params']}\n\n示例:\n{doc.get('example_code', '')}"
-                ))
-        
-        # 检索PyQGIS文档
-        if pyqgis_apis:
-            pyqgis_results = search_pyqgis_docs(pyqgis_apis)
-            for doc in pyqgis_results:
-                supplemental_docs.append(RelevantDoc(
-                    api_name=doc["api_name"],
-                    library="PyQGIS",
-                    content=doc["content"]
-                ))
-        
-        logger.info(f"Runtime API RAG: 成功补充{len(supplemental_docs)}个API文档")
-        
-    except Exception as e:
-        logger.error(f"Runtime API RAG失败: {e}")
-    
-    return supplemental_docs
+    # Runtime API RAG 暂时停用
+    logger.info("Runtime API RAG 已停用，跳过补充文档")
+    return []
 
 
 async def _capture_step_screenshot(session_id: str, step_id: int) -> str:
@@ -137,11 +218,9 @@ async def _capture_step_screenshot(session_id: str, step_id: int) -> str:
         
         # 通过MCP获取截图
         mcp_client = await get_mcp_client()
-        result = await mcp_client.capture_screenshot(
-            path=screenshot_file,
-            width=1200,
-            height=800,
-            timeout=10
+        await mcp_client.call_tool(
+            "capture_map_canvas",
+            {"path": screenshot_file, "width": 1200, "height": 800}
         )
         
         # 检查截图是否成功
@@ -234,19 +313,19 @@ async def _executor_node_async(state: AgentState) -> Dict[str, Any]:
         for doc in step_context.relevant_docs:
             api_context_parts.append(f"### {doc.api_name} ({doc.library})\n{doc.content}\n")
     
-    # 2. 构建Prompt
+    # 2. 构建Prompt与工具集
+    tools, tool_map, tool_catalog = await _build_mcp_tools(step_context)
+    
     thinking_instruction = ""
     if SUPPORT_THINKING_MODEL:
         thinking_instruction = """\n## 思考过程（可选）
 如果需要，你可以使用<thought>标签包裹你的思考过程：
 <thought>
-这里是你的思考过程，分析任务需求、选择合适的API、考虑潜在的问题等
+这里是你的思考过程，分析任务需求、选择合适的工具、考虑潜在的问题等
 </thought>
-
-然后输出代码。思考过程不会被执行，仅用于记录推理链。
 """
     
-    system_prompt = f"""你是一个专业的QGIS Python开发专家。你的任务是根据提供的API文档和任务描述，生成可执行的PyQGIS/GDAL代码。
+    system_prompt = f"""你是一个专业的QGIS开发专家。你的任务是根据提供的API文档和任务描述，通过工具调用完成当前步骤。
 
 ## 当前任务
 步骤ID: {step.step_id}
@@ -254,273 +333,187 @@ async def _executor_node_async(state: AgentState) -> Dict[str, Any]:
 
 ## 可用的API文档
 {''.join(api_context_parts) if api_context_parts else '未提供API文档'}
-{thinking_instruction}
-## 代码生成要求
-1. **严格参考API文档**: 参数名称、类型必须与文档完全一致，不要臆造参数
-2. **防御性编程**: 在执行前检查文件是否存在、图层是否已加载等
-3. **错误处理**: 使用try-except捕获异常，并打印清晰的错误信息
-4. **单步专注**: 只完成当前步骤的目标，不要执行后续步骤
-5. **文件路径**: 确保文件路径符合Host OS格式（Windows用反斜杠，Linux/Mac用正斜杠）
-6. **输出信息**: 使用print()输出关键信息，便于调试
-7. **Runtime API查询**: 如果发现需要的API文档缺失，在代码注释中标注#NEED_API: api_name，系统会自动补充
-8. **UI刷新**: 在操作完成后，使用以下代码确保QGIS界面更新：
-   - 添加图层后: QgsProject.instance().addMapLayer(layer) 会自动刷新
-   - 修改图层后: layer.triggerRepaint() 或 iface.mapCanvas().refresh()
-   - 缩放到图层: iface.setActiveLayer(layer) 然后 iface.zoomToActiveLayer()
-   - 最终返回前确保调用 iface.mapCanvas().refresh() 刷新地图画布
 
-## 输出格式
-只输出Python代码，不要包含任何解释文字或markdown标记。
+## 可用工具
+{tool_catalog}
+{thinking_instruction}
+## 规则
+1. **优先使用工具**: 通过工具调用完成任务（例如数据导入和导出），只有在工具不足时才使用 execute_code
+2. **环境检查**: 必要时先调用 inspect_qgis_env 或 get_layers 获取当前状态
+3. **Runtime API查询**: （已停用）
+4. **单步专注**: 只完成当前步骤目标，不要执行后续步骤
+5. **文件路径**: 路径必须符合Host OS格式
+6. **最终输出**: 当你认为步骤完成，输出“FINAL: ...”简短总结
 """
     
-    # 如果是重试，添加错误信息
     if retry_attempts > 0 and execution_logs:
         last_log = execution_logs[-1]
         if last_log.get("status") == "error":
             system_prompt += f"""
 ## 上一次执行失败
 错误信息: {last_log.get('error_detail', '未知错误')}
-
-请分析错误原因并修正代码。
 """
     
-    user_message = f"请为步骤 {step.step_id} 生成代码: {step.description}"
+    user_message = f"请完成步骤 {step.step_id}: {step.description}"
     
-    # 3. 调用LLM生成代码
-    logger.info("调用LLM生成代码...")
+    logger.info("调用LLM进行工具决策与执行...")
     
     try:
         llm_messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_message)
         ]
-        
-        response = llm.invoke(llm_messages)
-        raw_response = response.content.strip()
-        
-        # 提取思考过程（如果有）
-        thought_content = ""
-        generated_code = raw_response
-        
-        if SUPPORT_THINKING_MODEL and "<thought>" in raw_response and "</thought>" in raw_response:
-            import re
-            thought_match = re.search(r'<thought>(.*?)</thought>', raw_response, re.DOTALL)
-            if thought_match:
-                thought_content = thought_match.group(1).strip()
-                # 移除思考标签，保留代码
-                generated_code = re.sub(r'<thought>.*?</thought>', '', raw_response, flags=re.DOTALL).strip()
-                logger.info(f"提取到思考过程（{len(thought_content)}字符）: {thought_content[:100]}...")
-        
-        # 清理代码（移除可能的markdown包裹）
-        if generated_code.startswith("```python"):
-            generated_code = generated_code[9:]
-        if generated_code.startswith("```"):
-            generated_code = generated_code[3:]
-        if generated_code.endswith("```"):
-            generated_code = generated_code[:-3]
-        
-        generated_code = generated_code.strip()
-        
-        # 检查是否需要Runtime API补充
-        import re
-        need_apis = re.findall(r'#\s*NEED_API:\s*([\w\.]+)', generated_code)
-        if need_apis:
-            logger.info(f"检测到需要补充的API: {need_apis}")
-            # Runtime API RAG补充
-            supplemental_docs = await _runtime_api_rag(need_apis, step_context)
-            if supplemental_docs:
-                logger.info(f"补充了{len(supplemental_docs)}个API文档")
-                # 将补充文档添加到上下文并重新生成代码
-                for doc in supplemental_docs:
-                    api_context_parts.append(f"### {doc.api_name} ({doc.library})\n{doc.content}\n")
-                # 更新system_prompt并重新调用
-                # （这里简化处理，实际可以递归调用）
-        
-        logger.info(f"生成代码（{len(generated_code)}字符）:\n{generated_code[:200]}...")
-        
-        # 记录思考过程到messages
-        if thought_content:
-            messages.append(AIMessage(content=f"思考: {thought_content}"))
-        
-        # 记录代码
-        code_history.append(generated_code)
-        
-        # 4. 执行代码
-        logger.info("通过MCP执行代码...")
-        
-        # 启动状态推送任务（用于长时间运行的任务）
+        tool_bound_llm = llm.bind_tools(tools)
+
+        tool_actions: List[Dict[str, Any]] = []
+        tool_errors: List[str] = []
+        final_text: Optional[str] = None
+        max_action_rounds = 8
+
         stop_event = asyncio.Event()
         status_task = asyncio.create_task(
             _periodic_status_push(step.step_id, step.description, stop_event)
         )
-        
+
         try:
-            mcp_client = await get_mcp_client()
-            result = await mcp_client.execute_code(generated_code, timeout=120)
+            for round_idx in range(max_action_rounds):
+                response = tool_bound_llm.invoke(llm_messages)
+                llm_messages.append(response)
+
+                tool_calls = _extract_tool_calls(response)
+                if not tool_calls:
+                    final_text = (response.content or "").strip()
+                    break
+
+                for call_idx, call in enumerate(tool_calls):
+                    tool_name = call.get("name")
+                    args = call.get("args") or {}
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {"raw": args}
+
+                    tool = tool_map.get(tool_name)
+                    if not tool:
+                        result_text = f"工具不存在: {tool_name}"
+                        tool_errors.append(result_text)
+                    else:
+                        try:
+                            result = await tool.ainvoke(args)
+                            result_text = _tool_result_to_text(result)
+                        except Exception as e:
+                            result_text = f"工具执行失败: {tool_name}, {e}"
+                            tool_errors.append(result_text)
+
+                    tool_actions.append({
+                        "name": tool_name,
+                        "args": args,
+                        "result": result_text,
+                    })
+
+                    if tool_name == "execute_code":
+                        code = args.get("code") if isinstance(args, dict) else None
+                        if code:
+                            code_history.append(code)
+
+                    tool_call_id = call.get("id") or f"{tool_name}_{round_idx}_{call_idx}"
+                    llm_messages.append(ToolMessage(content=result_text, tool_call_id=tool_call_id))
+
+            if final_text is None:
+                final_text = "未能在限定轮次内完成任务"
+                tool_errors.append(final_text)
         finally:
-            # 停止状态推送
             stop_event.set()
             try:
                 await asyncio.wait_for(status_task, timeout=1.0)
             except asyncio.TimeoutError:
                 status_task.cancel()
-        
-        logger.info(f"执行结果: {result}")
-        
-        # 5. 解析执行结果
-        result_content = result.get("result", {}).get("content", [])
-        
-        if not result_content:
-            raise Exception("MCP返回结果为空")
-        
-        # 提取执行结果文本
-        result_text = ""
-        for content_item in result_content:
-            if content_item.get("type") == "text":
-                result_text += content_item.get("text", "")
-        
-        logger.debug(f"MCP原始返回: {result_text[:500]}")
-        
-        # 解析result_text中的JSON
-        # MCP可能返回多种格式:
-        # 1. {'status': 'success', 'result': {...}}
-        # 2. {'result': 'null'} 或 {'result': {...}}
-        # 3. 纯文本输出
-        try:
-            # 尝试提取最后一个包含result的JSON对象
-            import re
-            
-            # 查找所有JSON对象
-            json_objects = re.findall(r'\{[^{}]*\}', result_text)
-            
-            execution_result = None
-            for json_str in reversed(json_objects):  # 从后往前找
-                try:
-                    parsed = json.loads(json_str)
-                    if "result" in parsed or "status" in parsed:
-                        execution_result = parsed
-                        break
-                except:
-                    continue
-            
-            if not execution_result:
-                # 未找到有效JSON，使用整个文本
-                execution_result = {"status": "unknown", "result": result_text}
-            
-            # 检查是否有明确的status字段
-            if "status" not in execution_result:
-                # 根据result字段判断
-                result_value = execution_result.get("result")
-                if result_value == "null" or result_value is None:
-                    # null可能表示执行成功但无返回值
-                    execution_result["status"] = "success"
-                elif isinstance(result_value, dict) and "executed" in result_value:
-                    execution_result["status"] = "success" if result_value["executed"] else "error"
-                else:
-                    execution_result["status"] = "success"  # 有返回值视为成功
-                    
-        except Exception as e:
-            logger.warning(f"解析MCP结果失败: {e}, 使用原始文本")
-            execution_result = {"status": "unknown", "result": result_text}
-        
-        # 6. 检查执行状态
-        status = execution_result.get("status", "unknown")
-        
-        logger.info(f"解析后的执行状态: {status}, 完整结果: {execution_result}")
-        
-        # 当status为success或unknown（且result不是error）时视为成功
-        is_success = (status == "success") or (
-            status == "unknown" and 
-            "error" not in str(execution_result.get("result", "")).lower() and
-            "exception" not in str(execution_result.get("result", "")).lower()
+
+        logger.info(f"步骤 {step.step_id} 执行完成: {final_text}")
+
+        final_lower = (final_text or "").lower()
+        is_success = (
+            not tool_errors and
+            "error" not in final_lower and
+            "失败" not in final_text and
+            "异常" not in final_text
         )
-        
+
         if is_success:
             logger.info(f"步骤 {step.step_id} 执行成功")
-            
-            # 记录执行日志
+
             execution_logs.append({
                 "step_id": step.step_id,
                 "description": step.description,
                 "status": "success",
-                "code": generated_code,
-                "output": execution_result.get("result", {}),
+                "actions": tool_actions,
+                "final": final_text,
             })
-            
+
             save_execution_log(
                 session_id,
                 step.step_id,
                 f"步骤执行成功: {step.description}",
                 "success"
             )
-            
-            # 更新消息
-            messages.append(AIMessage(content=f"步骤 {step.step_id} 代码:\n```python\n{generated_code}\n```"))
-            messages.append(HumanMessage(content=f"执行成功"))
-            
-            # 每步成功后生成截图
+
+            messages.append(AIMessage(content=f"步骤 {step.step_id} 完成: {final_text}"))
+
             step_screenshot_path = await _capture_step_screenshot(session_id, step.step_id)
             if step_screenshot_path:
                 logger.info(f"步骤 {step.step_id} 截图: {step_screenshot_path}")
                 execution_logs[-1]["screenshot"] = step_screenshot_path
-            
-            # 移动到下一步，重置重试计数
+
             return {
                 "current_step_id": current_step_id + 1,
                 "execution_logs": execution_logs,
                 "code_history": code_history,
                 "retry_attempts": 0,
                 "messages": messages,
-                "screenshot_path": step_screenshot_path,  # 保存最新截图
+                "screenshot_path": step_screenshot_path,
             }
-        
-        else:
-            # 执行失败
-            error_detail = execution_result.get("message", "未知错误")
-            logger.error(f"步骤 {step.step_id} 执行失败: {error_detail}")
-            
-            # 记录执行日志
-            execution_logs.append({
-                "step_id": step.step_id,
-                "description": step.description,
-                "status": "error",
-                "code": generated_code,
-                "error_detail": error_detail,
-            })
-            
-            save_execution_log(
-                session_id,
-                step.step_id,
-                f"步骤执行失败: {error_detail}",
-                "error",
-                error_detail=error_detail
-            )
-            
-            # 检查是否达到重试上限
-            if retry_attempts >= MAX_RETRY_ATTEMPTS:
-                logger.error(f"步骤 {step.step_id} 达到最大重试次数 ({MAX_RETRY_ATTEMPTS})")
-                
-                messages.append(AIMessage(content=f"步骤 {step.step_id} 执行失败（已达到最大重试次数）"))
-                
-                return {
-                    "current_step_id": current_step_id,
-                    "execution_logs": execution_logs,
-                    "code_history": code_history,
-                    "retry_attempts": retry_attempts + 1,
-                    "messages": messages,
-                }
-            else:
-                logger.info(f"准备重试 (尝试 {retry_attempts + 1}/{MAX_RETRY_ATTEMPTS})...")
-                
-                messages.append(AIMessage(content=f"步骤 {step.step_id} 执行失败，准备重试..."))
-                
-                return {
-                    "current_step_id": current_step_id,
-                    "execution_logs": execution_logs,
-                    "code_history": code_history,
-                    "retry_attempts": retry_attempts + 1,
-                    "messages": messages,
-                }
+
+        error_detail = "；".join(tool_errors) if tool_errors else (final_text or "未知错误")
+        logger.error(f"步骤 {step.step_id} 执行失败: {error_detail}")
+
+        execution_logs.append({
+            "step_id": step.step_id,
+            "description": step.description,
+            "status": "error",
+            "actions": tool_actions,
+            "error_detail": error_detail,
+            "final": final_text,
+        })
+
+        save_execution_log(
+            session_id,
+            step.step_id,
+            f"步骤执行失败: {error_detail}",
+            "error",
+            error_detail=error_detail
+        )
+
+        if retry_attempts >= MAX_RETRY_ATTEMPTS:
+            logger.error(f"步骤 {step.step_id} 达到最大重试次数 ({MAX_RETRY_ATTEMPTS})")
+            messages.append(AIMessage(content=f"步骤 {step.step_id} 执行失败（已达到最大重试次数），将跳过该步骤"))
+            return {
+                "current_step_id": current_step_id + 1,
+                "execution_logs": execution_logs,
+                "code_history": code_history,
+                "retry_attempts": 0,
+                "messages": messages,
+            }
+
+        logger.info(f"准备重试 (尝试 {retry_attempts + 1}/{MAX_RETRY_ATTEMPTS})...")
+        messages.append(AIMessage(content=f"步骤 {step.step_id} 执行失败，准备重试..."))
+        return {
+            "current_step_id": current_step_id,
+            "execution_logs": execution_logs,
+            "code_history": code_history,
+            "retry_attempts": retry_attempts + 1,
+            "messages": messages,
+        }
         
     except Exception as e:
         logger.error(f"执行过程中发生异常: {e}")
@@ -541,6 +534,17 @@ async def _executor_node_async(state: AgentState) -> Dict[str, Any]:
             error_detail=str(e)
         )
         
+        if retry_attempts >= MAX_RETRY_ATTEMPTS:
+            logger.error(f"步骤 {step.step_id} 异常达到最大重试次数 ({MAX_RETRY_ATTEMPTS})，将跳过该步骤")
+            messages.append(AIMessage(content=f"步骤 {step.step_id} 执行异常（已达到最大重试次数），将跳过该步骤"))
+            return {
+                "current_step_id": current_step_id + 1,
+                "execution_logs": execution_logs,
+                "code_history": code_history,
+                "retry_attempts": 0,
+                "messages": messages,
+            }
+
         return {
             "current_step_id": current_step_id,
             "execution_logs": execution_logs,
