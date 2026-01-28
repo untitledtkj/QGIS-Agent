@@ -16,7 +16,7 @@ from agent.state import AgentState
 from agent.nodes.planner_node import planner_node
 from agent.nodes.api_rag_node import api_rag_node
 from agent.nodes.executor_node import executor_node
-from agent.nodes.reflector_node import reflector_node
+from agent.nodes.reflector_node import reflector_node_sync
 
 load_dotenv()
 
@@ -26,7 +26,9 @@ def should_continue_planning(state: AgentState) -> Literal["api_rag_node", "plan
     判断规划是否完成，是否需要继续修改
     
     逻辑:
-    - 如果status=True（用户批准）或retry_count>=3（强制退出），进入API RAG
+    - 如果plan已存在且status=True（已批准），直接进入API RAG
+    - 如果status=True但plan不存在，需要先将draft转为plan
+    - 如果retry_count>=3（强制退出），进入API RAG
     - 否则返回planner_node继续修改
     
     Args:
@@ -35,8 +37,21 @@ def should_continue_planning(state: AgentState) -> Literal["api_rag_node", "plan
     Returns:
         下一个节点名称
     """
-    if state.get("status", False) or state.get("retry_count", 0) >= 3:
+    # 优先检查：如果已有批准的plan，直接执行
+    if state.get("plan") and state.get("status", False):
         return "api_rag_node"
+    
+    # 其次检查：是否达到重试上限
+    if state.get("retry_count", 0) >= 3:
+        return "api_rag_node"
+    
+    # 检查：是否已批准draft（需要转换为plan）
+    if state.get("status", False) and state.get("draft"):
+        # 这种情况应该在planner_node中处理（将draft转为plan）
+        # 但为了安全，这里也返回api_rag_node
+        return "api_rag_node"
+    
+    # 默认：继续规划
     return "planner_node"
 
 
@@ -66,18 +81,28 @@ def should_continue_execution(state: AgentState) -> Literal["reflector_node", "e
     return "executor_node"
 
 
-def build_graph(checkpointer: Optional[PostgresSaver] = None) -> StateGraph:
+def build_graph(
+    checkpointer: Optional[PostgresSaver] = None,
+    interrupt_before: Optional[list] = None,
+    interrupt_after: Optional[list] = None
+) -> StateGraph:
     """
     构建LangGraph状态图
     
     工作流程:
-    1. Planner Node -> (HITL interrupt) -> API RAG Node
+    1. Planner Node -> (条件判断) -> API RAG Node 或继续修改
     2. API RAG Node -> Executor Node
     3. Executor Node -> (循环执行所有步骤) -> Reflector Node
-    4. Reflector Node -> (HITL interrupt) -> END
+    4. Reflector Node -> END
+    
+    HITL机制（需要checkpointer）:
+    - interrupt_before: 在指定节点之前中断（例如["api_rag_node"]用于计划审核）
+    - interrupt_after: 在指定节点之后中断（例如["reflector_node"]用于结果确认）
     
     Args:
-        checkpointer: PostgreSQL checkpointer，用于状态持久化
+        checkpointer: PostgreSQL checkpointer，用于状态持久化和HITL
+        interrupt_before: 在这些节点之前中断
+        interrupt_after: 在这些节点之后中断
         
     Returns:
         编译后的StateGraph
@@ -89,7 +114,7 @@ def build_graph(checkpointer: Optional[PostgresSaver] = None) -> StateGraph:
     workflow.add_node("planner_node", planner_node)
     workflow.add_node("api_rag_node", api_rag_node)
     workflow.add_node("executor_node", executor_node)
-    workflow.add_node("reflector_node", reflector_node)
+    workflow.add_node("reflector_node", reflector_node_sync)
     
     # 设置入口点
     workflow.set_entry_point("planner_node")
@@ -122,12 +147,16 @@ def build_graph(checkpointer: Optional[PostgresSaver] = None) -> StateGraph:
     workflow.add_edge("reflector_node", END)
     
     # 编译Graph
-    # 配置interrupt点用于HITL
-    app = workflow.compile(
-        checkpointer=checkpointer,
-        interrupt_before=["api_rag_node"],  # Planner审核后暂停
-        interrupt_after=["reflector_node"]  # Reflector人工确认后暂停
-    )
+    # 注意：interrupt功能需要checkpointer支持
+    if checkpointer:
+        compile_kwargs = {"checkpointer": checkpointer}
+        if interrupt_before:
+            compile_kwargs["interrupt_before"] = interrupt_before
+        if interrupt_after:
+            compile_kwargs["interrupt_after"] = interrupt_after
+        app = workflow.compile(**compile_kwargs)
+    else:
+        app = workflow.compile()
     
     return app
 
@@ -152,21 +181,23 @@ def create_checkpointer() -> PostgresSaver:
     return checkpointer
 
 
-def get_graph(with_checkpointer: bool = True) -> StateGraph:
+def get_graph(with_checkpointer: bool = True, interrupt_before: list = None, interrupt_after: list = None) -> StateGraph:
     """
     获取配置好的Graph实例
     
     Args:
         with_checkpointer: 是否启用状态持久化
+        interrupt_before: 在这些节点之前中断
+        interrupt_after: 在这些节点之后中断
         
     Returns:
         编译后的StateGraph
     """
     if with_checkpointer:
         checkpointer = create_checkpointer()
-        return build_graph(checkpointer)
+        return build_graph(checkpointer, interrupt_before=interrupt_before, interrupt_after=interrupt_after)
     else:
-        return build_graph()
+        return build_graph(interrupt_before=interrupt_before, interrupt_after=interrupt_after)
 
 
 if __name__ == "__main__":

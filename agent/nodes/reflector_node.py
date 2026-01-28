@@ -88,16 +88,49 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     
     log_summary_text = "\n".join(log_summary_parts)
     
+    # 提取代码中的关键信息（图层名、变量名）
+    layer_names = set()
+    variable_names = set()
+    
+    for log in execution_logs:
+        code = log.get("code", "")
+        if code:
+            # 提取图层名称（常见模式）
+            import re
+            # 匹配 QgsVectorLayer("path", "layer_name", ...)
+            layer_matches = re.findall(r'QgsVectorLayer\([^,]+,\s*["\']([^"\']+)["\']', code)
+            layer_names.update(layer_matches)
+            
+            # 匹配 QgsRasterLayer("path", "layer_name")
+            raster_matches = re.findall(r'QgsRasterLayer\([^,]+,\s*["\']([^"\']+)["\']', code)
+            layer_names.update(raster_matches)
+            
+            # 匹配 addVectorLayer(..., name="layer_name")
+            add_layer_matches = re.findall(r'add(?:Vector|Raster)Layer\([^)]*name\s*=\s*["\']([^"\']+)["\']', code)
+            layer_names.update(add_layer_matches)
+            
+            # 提取变量名（赋值语句）
+            var_matches = re.findall(r'^(\w+)\s*=\s*(?:Qgs|gdal|ogr)', code, re.MULTILINE)
+            variable_names.update(var_matches)
+    
+    # 构建详细信息字符串
+    detail_info = ""
+    if layer_names:
+        detail_info += f"\n图层: {', '.join(sorted(layer_names))}"
+    if variable_names:
+        detail_info += f"\n变量: {', '.join(sorted(variable_names))}"
+    
     # 调用LLM生成总结
-    system_prompt = """你是一个专业的GIS任务分析专家。请分析以下任务执行情况，生成简洁的总结报告。
+    system_prompt = f"""你是一个专业的GIS任务分析专家。请分析以下任务执行情况，生成简洁的总结报告。
 
 总结应包含:
 1. 任务完成情况（成功/失败）
 2. 关键步骤回顾
-3. 遇到的问题（如果有）
-4. 经验教训（如果有）
+3. 使用的图层和变量（如果有）
+4. 遇到的问题（如果有）
+5. 经验教训（如果有）
 
-请用简洁的中文回答，不超过300字。
+请用简洁的中文回答，不超过300字。{detail_info if detail_info else ''}
 """
     
     user_message = f"""
@@ -263,9 +296,9 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
             )
     
     # 6. 状态清理（按照技术文档清理清单）
-    # 保留的字段: log_summary, screenshot_path, input_query, is_completed, quality_score
+    # 保留的字段: log_summary, screenshot_path, input_query, is_completed
     # 清理的字段: draft, plan, api_context_structured, execution_logs, code_history, 
-    #            advise, retry_count, status, example, missing_deps, messages
+    #            advise, retry_count, status, example, missing_deps, messages, quality_score
     logger.info("执行状态清理...")
     
     cleaned_state = {
@@ -273,7 +306,6 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
         "final_summary": final_summary,
         "log_summary": final_summary,  # 用于下一轮Planner的上下文
         "screenshot_path": screenshot_path,
-        "quality_score": quality_score,
         "is_completed": is_completed,  # 待HITL实现后改为人工确认
         
         # 清理的字段（重置为初始值）
@@ -292,6 +324,7 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
         "messages": [],
         "current_step_id": 0,
         "retry_attempts": 0,
+        "quality_score": 0.0,  # 按文档要求清理
     }
     
     # 保存最终日志
@@ -305,3 +338,22 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     logger.info("状态清理完成，节点执行结束")
     
     return cleaned_state
+
+
+# 同步包装器 - 用于LangGraph的同步执行
+def reflector_node_sync(state: AgentState) -> Dict[str, Any]:
+    """reflector_node的同步包装器"""
+    import asyncio
+    import nest_asyncio
+    
+    # 允许嵌套事件循环
+    nest_asyncio.apply()
+    
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 没有运行中的事件循环，创建新的
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    return loop.run_until_complete(reflector_node(state))

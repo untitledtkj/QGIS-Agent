@@ -35,11 +35,12 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
     规划器节点 - 生成执行计划
     
     工作流程:
-    1. 查询重写（综合input_query、log_summary、advise）
-    2. 如果是首次规划，检索Cookbook中的相似案例
-    3. 调用LLM生成执行计划
-    4. 返回draft计划，等待人工审核
-    5. 强制退出机制（retry_count >= 3时强制执行）
+    1. 如果plan已存在且status=True，直接返回（已批准，不再规划）
+    2. 查询重写（综合input_query、log_summary、advise）
+    3. 如果是首次规划，检索Cookbook中的相似案例
+    4. 调用LLM生成执行计划
+    5. 返回draft计划，等待人工审核
+    6. 强制退出机制（retry_count >= 3时强制执行）
     
     Args:
         state: 当前Agent状态
@@ -56,6 +57,26 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
     advise = state.get("advise")
     log_summary = state.get("log_summary")
     retry_count = state.get("retry_count", 0)
+    plan = state.get("plan")
+    draft = state.get("draft")
+    status = state.get("status", False)
+    
+    # 情况1: 如果计划已批准且plan已存在，直接返回（不再重新规划）
+    if plan and status:
+        logger.info("计划已批准且plan已存在，跳过规划步骤")
+        return {
+            "plan": plan,
+            "status": True
+        }
+    
+    # 情况2: 如果已批准但plan不存在（只有draft），将draft提升为plan
+    if status and draft and not plan:
+        logger.info("将已批准的draft提升为plan")
+        return {
+            "draft": draft,
+            "plan": draft,  # 提升为plan
+            "status": True
+        }
     
     # 保存日志
     save_execution_log(

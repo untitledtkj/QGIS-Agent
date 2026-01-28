@@ -14,7 +14,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from agent.state import AgentState, RelevantDoc, StepContext
-from agent.tools.rag import search_gdal_docs, search_pyqgis_docs
+from agent.tools.rag import search_gdal_docs, search_gdal_docs_fuzzy, search_pyqgis_docs
 from agent.tools.database import save_execution_log
 
 load_dotenv()
@@ -85,7 +85,7 @@ def api_rag_node(state: AgentState) -> Dict[str, Any]:
     
     logger.info(f"需要检索的API: GDAL={len(all_gdal_apis)}, PyQGIS={len(all_pyqgis_apis)}")
     
-    # 2. 检索API文档（精确搜索）
+    # 2. 检索API文档（精确搜索，失败则降级到模糊搜索）
     # Planner现在会输出完整的API格式（如osgeo.gdal.Warp），所以可以直接精确搜索
     gdal_docs = []
     pyqgis_docs = []
@@ -93,10 +93,26 @@ def api_rag_node(state: AgentState) -> Dict[str, Any]:
     found_pyqgis_apis = set()
     
     if all_gdal_apis:
+        # 先尝试精确搜索
         gdal_docs = search_gdal_docs(all_gdal_apis)
-        logger.info(f"找到GDAL文档: {len(gdal_docs)}个")
+        logger.info(f"精确搜索找到GDAL文档: {len(gdal_docs)}个")
         for doc in gdal_docs:
             found_gdal_apis.add(doc["api_name"])
+        
+        # 对于未找到的API，尝试模糊搜索
+        not_found_gdal = set(all_gdal_apis) - found_gdal_apis
+        if not_found_gdal:
+            logger.info(f"对{len(not_found_gdal)}个未找到的GDAL API尝试模糊搜索...")
+            for api_name in not_found_gdal:
+                # 提取API名称的最后部分作为搜索关键词（如Warp, Translate等）
+                search_key = api_name.split('.')[-1]
+                fuzzy_results = search_gdal_docs_fuzzy(search_key, limit=3)
+                if fuzzy_results:
+                    # 选择相似度最高的结果
+                    best_match = fuzzy_results[0]
+                    logger.info(f"模糊搜索: '{api_name}' -> '{best_match['api_name']}' (相似度={best_match.get('sim_score', 0):.2f})")
+                    gdal_docs.append(best_match)
+                    found_gdal_apis.add(best_match["api_name"])
     
     if all_pyqgis_apis:
         pyqgis_docs = search_pyqgis_docs(all_pyqgis_apis)

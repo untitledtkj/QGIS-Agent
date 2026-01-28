@@ -8,6 +8,7 @@ from typing import Dict, Any, List
 import logging
 import json
 import os
+import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -36,6 +37,32 @@ MAX_RETRY_ATTEMPTS = 3
 
 # 是否支持思考模型（如deepseek-reasoner）
 SUPPORT_THINKING_MODEL = os.getenv("SUPPORT_THINKING_MODEL", "true").lower() == "true"
+
+# 状态推送间隔（秒）
+STATUS_PUSH_INTERVAL = 5
+
+
+async def _periodic_status_push(step_id: int, description: str, stop_event: asyncio.Event):
+    """
+    定期推送任务执行状态
+    
+    Args:
+        step_id: 当前步骤ID
+        description: 步骤描述
+        stop_event: 停止事件，设置后停止推送
+    """
+    elapsed_seconds = 0
+    
+    while not stop_event.is_set():
+        await asyncio.sleep(STATUS_PUSH_INTERVAL)
+        elapsed_seconds += STATUS_PUSH_INTERVAL
+        
+        # 推送状态信息（这里输出到日志，实际可以通过SSE推送到前端）
+        status_message = f"步骤 {step_id} 正在执行中... ({elapsed_seconds}秒) - {description}"
+        logger.info(f"[状态推送] {status_message}")
+        
+        # TODO: 在实际应用中，可以通过SSE向前端推送状态
+        # await sse_client.push_status(status_message)
 
 
 async def _runtime_api_rag(api_names: List[str], step_context: StepContext) -> List[RelevantDoc]:
@@ -236,6 +263,11 @@ async def _executor_node_async(state: AgentState) -> Dict[str, Any]:
 5. **文件路径**: 确保文件路径符合Host OS格式（Windows用反斜杠，Linux/Mac用正斜杠）
 6. **输出信息**: 使用print()输出关键信息，便于调试
 7. **Runtime API查询**: 如果发现需要的API文档缺失，在代码注释中标注#NEED_API: api_name，系统会自动补充
+8. **UI刷新**: 在操作完成后，使用以下代码确保QGIS界面更新：
+   - 添加图层后: QgsProject.instance().addMapLayer(layer) 会自动刷新
+   - 修改图层后: layer.triggerRepaint() 或 iface.mapCanvas().refresh()
+   - 缩放到图层: iface.setActiveLayer(layer) 然后 iface.zoomToActiveLayer()
+   - 最终返回前确保调用 iface.mapCanvas().refresh() 刷新地图画布
 
 ## 输出格式
 只输出Python代码，不要包含任何解释文字或markdown标记。
@@ -316,8 +348,22 @@ async def _executor_node_async(state: AgentState) -> Dict[str, Any]:
         # 4. 执行代码
         logger.info("通过MCP执行代码...")
         
-        mcp_client = await get_mcp_client()
-        result = await mcp_client.execute_code(generated_code, timeout=120)
+        # 启动状态推送任务（用于长时间运行的任务）
+        stop_event = asyncio.Event()
+        status_task = asyncio.create_task(
+            _periodic_status_push(step.step_id, step.description, stop_event)
+        )
+        
+        try:
+            mcp_client = await get_mcp_client()
+            result = await mcp_client.execute_code(generated_code, timeout=120)
+        finally:
+            # 停止状态推送
+            stop_event.set()
+            try:
+                await asyncio.wait_for(status_task, timeout=1.0)
+            except asyncio.TimeoutError:
+                status_task.cancel()
         
         logger.info(f"执行结果: {result}")
         

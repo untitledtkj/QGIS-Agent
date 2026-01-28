@@ -239,6 +239,258 @@ class QGISMCPClient:
             {"path": path, "width": width, "height": height},
             timeout=timeout
         )
+    
+    async def get_qgis_info(self, timeout: int = 10) -> Dict[str, Any]:
+        """
+        获取QGIS信息
+        
+        Args:
+            timeout: 超时时间（秒）
+            
+        Returns:
+            QGIS信息
+        """
+        return await self.call_tool("get_qgis_info", {}, timeout=timeout)
+    
+    async def load_project(self, path: str, timeout: int = 30) -> Dict[str, Any]:
+        """
+        加载QGIS项目
+        
+        Args:
+            path: 项目文件路径
+            timeout: 超时时间（秒）
+            
+        Returns:
+            加载结果
+        """
+        return await self.call_tool("load_project", {"path": path}, timeout=timeout)
+    
+    async def create_new_project(self, path: str, timeout: int = 30) -> Dict[str, Any]:
+        """
+        创建新项目并保存
+        
+        Args:
+            path: 项目保存路径
+            timeout: 超时时间（秒）
+            
+        Returns:
+            创建结果
+        """
+        return await self.call_tool("create_new_project", {"path": path}, timeout=timeout)
+    
+    async def get_project_info(self, timeout: int = 10) -> Dict[str, Any]:
+        """
+        获取当前项目信息
+        
+        Args:
+            timeout: 超时时间（秒）
+            
+        Returns:
+            项目信息
+        """
+        return await self.call_tool("get_project_info", {}, timeout=timeout)
+    
+    async def add_vector_layer(
+        self,
+        path: str,
+        provider: str = "ogr",
+        name: Optional[str] = None,
+        timeout: int = 30
+    ) -> Dict[str, Any]:
+        """
+        添加矢量图层
+        
+        Args:
+            path: 图层文件路径
+            provider: 数据提供者（默认ogr）
+            name: 图层名称（可选）
+            timeout: 超时时间（秒）
+            
+        Returns:
+            添加结果
+        """
+        params = {"path": path, "provider": provider}
+        if name:
+            params["name"] = name
+        return await self.call_tool("add_vector_layer", params, timeout=timeout)
+    
+    async def add_raster_layer(
+        self,
+        path: str,
+        provider: str = "gdal",
+        name: Optional[str] = None,
+        timeout: int = 30
+    ) -> Dict[str, Any]:
+        """
+        添加栅格图层
+        
+        Args:
+            path: 图层文件路径
+            provider: 数据提供者（默认gdal）
+            name: 图层名称（可选）
+            timeout: 超时时间（秒）
+            
+        Returns:
+            添加结果
+        """
+        params = {"path": path, "provider": provider}
+        if name:
+            params["name"] = name
+        return await self.call_tool("add_raster_layer", params, timeout=timeout)
+    
+    async def get_layers(self, timeout: int = 10) -> Dict[str, Any]:
+        """
+        获取所有图层列表
+        
+        Args:
+            timeout: 超时时间（秒）
+            
+        Returns:
+            图层列表
+        """
+        return await self.call_tool("get_layers", {}, timeout=timeout)
+    
+    async def remove_layer(self, layer_id: str, timeout: int = 10) -> Dict[str, Any]:
+        """
+        移除指定图层
+        
+        Args:
+            layer_id: 图层ID
+            timeout: 超时时间（秒）
+            
+        Returns:
+            移除结果
+        """
+        return await self.call_tool("remove_layer", {"layer_id": layer_id}, timeout=timeout)
+    
+    async def zoom_to_layer(self, layer_id: str, timeout: int = 10) -> Dict[str, Any]:
+        """
+        缩放到指定图层范围
+        
+        Args:
+            layer_id: 图层ID
+            timeout: 超时时间（秒）
+            
+        Returns:
+            缩放结果
+        """
+        return await self.call_tool("zoom_to_layer", {"layer_id": layer_id}, timeout=timeout)
+    
+    async def get_layer_features(
+        self,
+        layer_id: str,
+        limit: int = 10,
+        timeout: int = 30
+    ) -> Dict[str, Any]:
+        """
+        获取图层要素
+        
+        Args:
+            layer_id: 图层ID
+            limit: 返回要素数量限制
+            timeout: 超时时间（秒）
+            
+        Returns:
+            要素列表
+        """
+        return await self.call_tool(
+            "get_layer_features",
+            {"layer_id": layer_id, "limit": limit},
+            timeout=timeout
+        )
+    
+    async def execute_processing(
+        self,
+        algorithm: str,
+        parameters: Dict[str, Any],
+        timeout: int = 300
+    ) -> Dict[str, Any]:
+        """
+        执行QGIS处理算法
+        
+        Args:
+            algorithm: 算法名称
+            parameters: 算法参数
+            timeout: 超时时间（秒），处理算法可能耗时较长
+            
+        Returns:
+            执行结果
+        """
+        return await self.call_tool(
+            "execute_processing",
+            {"algorithm": algorithm, "parameters": parameters},
+            timeout=timeout
+        )
+    
+    async def save_project(self, path: Optional[str] = None, timeout: int = 30) -> Dict[str, Any]:
+        """
+        保存项目
+        
+        Args:
+            path: 保存路径（可选，默认保存到当前项目路径）
+            timeout: 超时时间（秒）
+            
+        Returns:
+            保存结果
+        """
+        params = {}
+        if path:
+            params["path"] = path
+        return await self.call_tool("save_project", params, timeout=timeout)
+    
+    async def render_map(
+        self,
+        path: str,
+        width: int = 800,
+        height: int = 600,
+        timeout: int = 30
+    ) -> Dict[str, Any]:
+        """
+        渲染地图到图片文件
+        
+        Args:
+            path: 保存路径
+            width: 图片宽度
+            height: 图片高度
+            timeout: 超时时间（秒）
+            
+        Returns:
+            渲染结果
+        """
+        return await self.call_tool(
+            "render_map",
+            {"path": path, "width": width, "height": height},
+            timeout=timeout
+        )
+    
+    async def inspect_qgis_env(self, timeout: int = 10) -> Dict[str, Any]:
+        """
+        检查QGIS环境状态（组合工具）
+        获取项目信息和图层列表
+        
+        Args:
+            timeout: 超时时间（秒）
+            
+        Returns:
+            环境信息（包含项目信息和图层列表）
+        """
+        try:
+            # 并行获取项目信息和图层列表
+            project_info = await self.get_project_info(timeout=timeout)
+            layers_info = await self.get_layers(timeout=timeout)
+            
+            return {
+                "success": True,
+                "project": project_info,
+                "layers": layers_info,
+                "message": "环境检查完成"
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "message": "环境检查失败"
+            }
 
 
 # 全局MCP客户端实例
@@ -256,7 +508,34 @@ async def get_mcp_client() -> QGISMCPClient:
     global _mcp_client
     
     async with _client_lock:
+        # 检查是否需要重新创建客户端
+        need_reconnect = False
+        
         if _mcp_client is None:
+            need_reconnect = True
+        else:
+            # 检查事件循环是否已关闭
+            try:
+                if _mcp_client._session and _mcp_client._session.closed:
+                    need_reconnect = True
+                    logger.info("MCP客户端会话已关闭，需要重新连接")
+                # 检查事件循环
+                elif _mcp_client.sse_task and _mcp_client.sse_task.done():
+                    need_reconnect = True
+                    logger.info("MCP客户端SSE任务已结束，需要重新连接")
+            except Exception as e:
+                logger.warning(f"检查MCP客户端状态失败: {e}，尝试重新连接")
+                need_reconnect = True
+        
+        if need_reconnect:
+            # 先清理旧连接
+            if _mcp_client is not None:
+                try:
+                    await _mcp_client.disconnect()
+                except:
+                    pass
+            
+            # 创建新连接
             _mcp_client = QGISMCPClient()
             await _mcp_client.connect()
             if not _mcp_client.session_id:
@@ -273,3 +552,20 @@ async def close_mcp_client():
         if _mcp_client:
             await _mcp_client.disconnect()
             _mcp_client = None
+
+
+async def reset_mcp_client():
+    """
+    强制重置MCP客户端（用于事件循环切换时）
+    """
+    global _mcp_client
+    
+    async with _client_lock:
+        if _mcp_client:
+            try:
+                await _mcp_client.disconnect()
+            except Exception as e:
+                logger.warning(f"关闭旧客户端时出错: {e}")
+            _mcp_client = None
+        
+        logger.info("MCP客户端已重置")
