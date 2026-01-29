@@ -7,6 +7,7 @@ Reflector Node - 反思与归档节点
 from typing import Dict, Any
 import logging
 import os
+import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -55,11 +56,12 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     session_id = state["session_id"]
     input_query = state["input_query"]
     plan = state.get("plan")
+    messages = state.get("messages", [])
     execution_logs = state.get("execution_logs", [])
-    code_history = state.get("code_history", [])
     
     # 保存日志
-    save_execution_log(
+    await asyncio.to_thread(
+        save_execution_log,
         session_id,
         None,
         "开始任务反思与归档",
@@ -68,50 +70,52 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     
     # 1. 分析执行结果
     total_steps = len(plan.steps) if plan else 0
-    success_count = sum(1 for log in execution_logs if log.get("status") == "success")
-    error_count = sum(1 for log in execution_logs if log.get("status") == "error")
-    
-    is_success = success_count == total_steps and error_count == 0
-    
-    logger.info(f"执行统计: 总步骤={total_steps}, 成功={success_count}, 失败={error_count}")
+    is_completed = state.get("is_completed")
+    if is_completed is None:
+        is_success = len(messages) > 0
+    else:
+        is_success = bool(is_completed)
+
+    success_count = 1 if is_success else 0
+    error_count = 0 if is_success else 1
     
     # 2. 生成任务总结
     logger.info("生成任务总结...")
     
     # 构建执行日志摘要
     log_summary_parts = []
-    for log in execution_logs:
-        status_emoji = "✅" if log.get("status") == "success" else "❌"
-        log_summary_parts.append(
-            f"{status_emoji} 步骤 {log.get('step_id')}: {log.get('description')} - {log.get('status')}"
-        )
+
+    for msg in messages:
+        content = getattr(msg, "content", "") or ""
+        if content:
+            log_summary_parts.append(f"- {content}")
     
-    log_summary_text = "\n".join(log_summary_parts)
+    log_summary_text = "\n".join(log_summary_parts) if log_summary_parts else "无可用日志"
     
     # 提取代码中的关键信息（图层名、变量名）
     layer_names = set()
     variable_names = set()
     
-    for log in execution_logs:
-        code = log.get("code", "")
-        if code:
-            # 提取图层名称（常见模式）
-            import re
-            # 匹配 QgsVectorLayer("path", "layer_name", ...)
-            layer_matches = re.findall(r'QgsVectorLayer\([^,]+,\s*["\']([^"\']+)["\']', code)
-            layer_names.update(layer_matches)
+    # for log in execution_logs:
+    #     code = log.get("code", "")
+    #     if code:
+    #         # 提取图层名称（常见模式）
+    #         import re
+    #         # 匹配 QgsVectorLayer("path", "layer_name", ...)
+    #         layer_matches = re.findall(r'QgsVectorLayer\([^,]+,\s*["\']([^"\']+)["\']', code)
+    #         layer_names.update(layer_matches)
             
-            # 匹配 QgsRasterLayer("path", "layer_name")
-            raster_matches = re.findall(r'QgsRasterLayer\([^,]+,\s*["\']([^"\']+)["\']', code)
-            layer_names.update(raster_matches)
+    #         # 匹配 QgsRasterLayer("path", "layer_name")
+    #         raster_matches = re.findall(r'QgsRasterLayer\([^,]+,\s*["\']([^"\']+)["\']', code)
+    #         layer_names.update(raster_matches)
             
-            # 匹配 addVectorLayer(..., name="layer_name")
-            add_layer_matches = re.findall(r'add(?:Vector|Raster)Layer\([^)]*name\s*=\s*["\']([^"\']+)["\']', code)
-            layer_names.update(add_layer_matches)
+    #         # 匹配 addVectorLayer(..., name="layer_name")
+    #         add_layer_matches = re.findall(r'add(?:Vector|Raster)Layer\([^)]*name\s*=\s*["\']([^"\']+)["\']', code)
+    #         layer_names.update(add_layer_matches)
             
-            # 提取变量名（赋值语句）
-            var_matches = re.findall(r'^(\w+)\s*=\s*(?:Qgs|gdal|ogr)', code, re.MULTILINE)
-            variable_names.update(var_matches)
+    #         # 提取变量名（赋值语句）
+    #         var_matches = re.findall(r'^(\w+)\s*=\s*(?:Qgs|gdal|ogr)', code, re.MULTILINE)
+    #         variable_names.update(var_matches)
     
     # 构建详细信息字符串
     detail_info = ""
@@ -142,8 +146,7 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
 {log_summary_text}
 
 总步骤数: {total_steps}
-成功步骤: {success_count}
-失败步骤: {error_count}
+执行结果: {"成功" if is_success else "失败"}
 """
     
     try:
@@ -152,14 +155,14 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
             HumanMessage(content=user_message)
         ]
         
-        response = llm.invoke(messages)
+        response = await llm.ainvoke(messages)
         final_summary = response.content.strip()
         
         logger.info(f"生成总结: {final_summary[:100]}...")
         
     except Exception as e:
         logger.error(f"生成总结失败: {e}")
-        final_summary = f"任务{'成功' if is_success else '失败'} (总步骤: {total_steps}, 成功: {success_count}, 失败: {error_count})"
+        final_summary = f"任务{'成功' if is_success else '失败'} (总步骤: {total_steps})"
     
     # 3. 评估任务价值
     quality_score = 0.0
@@ -187,9 +190,9 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     
     # 4. 人工结项检查 (HITL)
     # 通过interrupt_after机制，用户在UI中确认is_completed
-    # 此处从state中读取用户确认的值
     # 注意：interrupt恢复后，is_completed应该已经由用户设置
-    is_completed = state.get("is_completed", is_success)  # 如果用户未设置，使用自动判断的默认值
+    if is_completed is None:
+        is_completed = is_success
     logger.info(f"任务完成状态（由用户确认或默认判断）: {is_completed}")
     
     # 5. 归档到Cookbook（技术文档要求: quality_score > 0.6）
@@ -218,7 +221,8 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
         
         # 保存到Cookbook
         try:
-            entry_id = save_cookbook_entry(
+            entry_id = await asyncio.to_thread(
+                save_cookbook_entry,
                 user_intent=input_query,
                 verified_code=verified_code,
                 tags=tags,
@@ -232,7 +236,8 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
             
             if entry_id:
                 logger.info(f"成功归档到Cookbook: entry_id={entry_id}")
-                save_execution_log(
+                await asyncio.to_thread(
+                    save_execution_log,
                     session_id,
                     None,
                     f"任务归档到Cookbook: entry_id={entry_id}",
@@ -275,7 +280,8 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
             if os.path.exists(screenshot_file):
                 screenshot_path = screenshot_file
                 logger.info(f"截图保存成功: {screenshot_path}")
-                save_execution_log(
+                await asyncio.to_thread(
+                    save_execution_log,
                     session_id,
                     None,
                     f"截图保存: {screenshot_path}",
@@ -286,7 +292,8 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
         
         except Exception as e:
             logger.error(f"生成截图失败: {e}")
-            save_execution_log(
+            await asyncio.to_thread(
+                save_execution_log,
                 session_id,
                 None,
                 f"生成截图失败: {str(e)}",
@@ -326,7 +333,8 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     }
     
     # 保存最终日志
-    save_execution_log(
+    await asyncio.to_thread(
+        save_execution_log,
         session_id,
         None,
         f"任务完成: {final_summary[:100]}",
@@ -338,20 +346,4 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     return cleaned_state
 
 
-# 同步包装器 - 用于LangGraph的同步执行
-def reflector_node_sync(state: AgentState) -> Dict[str, Any]:
-    """reflector_node的同步包装器"""
-    import asyncio
-    import nest_asyncio
-    
-    # 允许嵌套事件循环
-    nest_asyncio.apply()
-    
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # 没有运行中的事件循环，创建新的
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    
-    return loop.run_until_complete(reflector_node(state))
+# 仅保留异步版本

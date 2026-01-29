@@ -5,12 +5,14 @@ Planner Node - 规划器节点
 """
 
 from typing import Dict, Any
+import asyncio
 import logging
-import json
 import os
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+from jinja2 import Template
 
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from agent.state import AgentState, Plan, Step
@@ -23,14 +25,109 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 创建LLM实例
+# 定义结构化输出模型
+class PlannerOutput(BaseModel):
+    """Planner节点的结构化输出"""
+    
+    task: str = Field(description="任务简述（例如: Align raster and vector layers）")
+    steps: list[Step] = Field(description="执行步骤列表")
+    metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="元数据，包含iteration和has_example_reference等信息"
+    )
+
+# 创建LLM实例（使用JSON模式以确保兼容性）
 llm = ChatOpenAI(
     model=os.getenv("OPENAI_MODEL_NAME", "deepseek-chat"),
     temperature=0.1
-)
+).bind(response_format={"type": "json_object"})
+
+# 定义Query Rewriting模板
+QUERY_REWRITE_TEMPLATE = Template("""请将以下信息综合成一个清晰的GIS任务描述，用于检索相似案例。
+
+原始需求: {{ input_query }}
+{% if log_summary %}
+
+上轮执行总结: {{ log_summary }}
+{% endif %}
+{% if advise %}
+
+用户修改意见: {{ advise }}
+{% endif %}
+
+请用一句话概括核心任务，包含关键的GIS操作类型（如裁剪、重投影、缓冲区等）。
+""")
+
+# 定义System Prompt模板
+SYSTEM_PROMPT_TEMPLATE = Template("""你是一个专业的QGIS地理数据处理专家。你的任务是将用户的自然语言需求转化为可执行的QGIS操作步骤。
+
+## 输出格式
+请严格按照以下JSON格式输出：
+
+{
+  "task": "任务简述（例如: Align raster and vector layers）",
+  "steps": [
+    {
+      "step_id": 1,
+      "description": "步骤描述（例如: Load raster layer from file）",
+      "gdal_api": ["可能用到的GDAL API名称，如果没有则留空"],
+      "pyqgis_api": ["可能用到的PyQGIS API名称，如果没有则留空"]
+    }
+  ],
+  "metadata": {}
+}
+
+## API使用与命名规范（重要）
+请务必使用**完整的API名称格式**：
+
+GDAL API往往用于数据处理
+常用GDAL API示例：
+- 打开文件: osgeo.gdal.Open, osgeo.ogr.Open
+- 影像处理: osgeo.gdal.Warp, osgeo.gdal.Translate
+- 创建数据集: osgeo.gdal.GetDriverByName
+
+PyQGIS API往往用于QGIS内部的图层以及可视化操作
+常用PyQGIS API示例：
+- 图层操作: QgsVectorLayer, QgsRasterLayer
+- 项目管理: QgsProject
+- 几何操作: QgsGeometry
+
+## 注意事项
+1. 步骤不要拆分太细，每个步骤应该是中低复杂度的目标，且涉及文件必须包含路径信息
+2. 文件的导入与导出不要使用GDAL或者PYQGIS的代码，只需在步骤中api留空
+3. gdal_api和pyqgis_api列出所有可能用到的API名称（不需要参数细节），如果该步骤不需要使用某类API，可以留空
+4. 参考相似案例可以提高准确性
+5. 必须返回有效的JSON格式，不要添加任何额外的解释文字
+""")
+
+# 定义User Message模板
+USER_MESSAGE_TEMPLATE = Template("""用户需求: {{ input_query }}
+{% if log_summary %}
+
+上一轮执行总结:
+{{ log_summary }}
+{% endif %}
+{% if advise %}
+
+用户修改意见:
+{{ advise }}
+{% endif %}
+{% if examples_list %}
+
+相似案例参考（按相似度排序）:
+{% for case in examples_list %}
+案例 {{ loop.index }} (相似度: {{ "%.2f"|format(case.similarity_score) }}):
+- 原始需求: {{ case.user_intent }}
+- 参考代码:
+```python
+{{ case.verified_code }}
+```
+{% endfor %}
+{% endif %}
+""")
 
 
-def planner_node(state: AgentState) -> Dict[str, Any]:
+async def planner_node(state: AgentState) -> Dict[str, Any]:
     """
     规划器节点 - 生成执行计划
     
@@ -79,7 +176,8 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
         }
     
     # 保存日志
-    save_execution_log(
+    await asyncio.to_thread(
+        save_execution_log,
         session_id,
         None,
         f"开始规划任务: {input_query}",
@@ -97,18 +195,14 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
     
     if advise or log_summary:
         logger.info("执行查询重写...")
-        rewrite_prompt = f"""请将以下信息综合成一个清晰的GIS任务描述，用于检索相似案例。
-
-原始需求: {input_query}
-
-{"上轮执行总结: " + log_summary if log_summary else ""}
-
-{"用户修改意见: " + advise if advise else ""}
-
-请用一句话概括核心任务，包含关键的GIS操作类型（如裁剪、重投影、缓冲区等）。"""
+        rewrite_prompt = QUERY_REWRITE_TEMPLATE.render(
+            input_query=input_query,
+            log_summary=log_summary,
+            advise=advise
+        )
 
         try:
-            response = llm.invoke([HumanMessage(content=rewrite_prompt)])
+            response = await llm.ainvoke([HumanMessage(content=rewrite_prompt)])
             search_query = response.content.strip()
             logger.info(f"重写后的查询: {search_query}")
         except Exception as e:
@@ -133,94 +227,34 @@ def planner_node(state: AgentState) -> Dict[str, Any]:
         else:
             logger.info("未找到相似案例")
     
-    # 3. 构建Prompt
-    system_prompt = """你是一个专业的QGIS地理数据处理专家。你的任务是将用户的自然语言需求转化为可执行的QGIS操作步骤。
-
-## 输出格式
-请以JSON格式输出执行计划，包含以下字段：
-
-{
-  "task": "任务简述（例如: Align raster and vector layers）",
-  "steps": [
-    {
-      "step_id": 1,
-      "description": "步骤描述（例如: Load raster layer from file）",
-      "gdal_api": ["可能用到的GDAL API名称"],
-      "pyqgis_api": ["可能用到的PyQGIS API名称"]
-    }
-  ],
-  "metadata": {
-    "iteration": 1,
-    "has_example_reference": true/false
-  }
-}
-
-## API使用与命名规范（重要）
-请务必使用**完整的API名称格式**：
-
-GDAL API往往用于数据处理
-常用GDAL API示例：
-- 打开文件: osgeo.gdal.Open, osgeo.ogr.Open
-- 影像处理: osgeo.gdal.Warp, osgeo.gdal.Translate
-- 创建数据集: osgeo.gdal.GetDriverByName
-
-PyQGIS API往往用于QGIS内部的图层以及可视化操作
-常用PyQGIS API示例：
-- 图层操作: QgsVectorLayer, QgsRasterLayer
-- 项目管理: QgsProject
-- 几何操作: QgsGeometry
-
-## 注意事项
-1. 步骤不要拆分太细，每个步骤应该是中低复杂度的目标
-2. 数据的导入与导出不需要使用GDAL或者PYQGIS的代码（因为有专门工具实现），只需在步骤中描述即可
-3. gdal_api和pyqgis_api列出所有可能用到的API名称（不需要参数细节），如果该步骤不需要使用某类API，可以留空
-4. 参考相似案例可以提高准确性
-"""
+    # 3. 构建Prompt（使用Jinja2模板）
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.render()
     
-    # 构建用户消息
-    user_parts = [f"用户需求: {input_query}"]
+    user_message = USER_MESSAGE_TEMPLATE.render(
+        input_query=input_query,
+        log_summary=log_summary,
+        advise=advise,
+        examples_list=examples_list[:3] if examples_list else []
+    )
     
-    # 添加上一轮执行总结（如果有）
-    if log_summary:
-        user_parts.append(f"\n上一轮执行总结:\n{log_summary}")
-    
-    # 添加用户修改意见（如果有）
-    if advise:
-        user_parts.append(f"\n用户修改意见:\n{advise}")
-    
-    # 添加相似案例（如果有）
-    if examples_list:
-        cases_text = []
-        for i, case in enumerate(examples_list[:3], 1):  # 最多显示3个案例
-            cases_text.append(f"""
-案例 {i} (相似度: {case['similarity_score']:.2f}):
-- 原始需求: {case['user_intent']}
-- 参考代码:
-```python
-{case['verified_code']}
-```
-""")
-        
-        user_parts.append("\n相似案例参考（按相似度排序）:\n" + "\n".join(cases_text))
-    
-    user_message = "\n".join(user_parts)
-    
-    # 3. 调用LLM生成计划
-    logger.info("调用LLM生成执行计划...")
+    # 4. 调用LLM生成计划（使用JSON模式）
+    logger.info("调用LLM生成执行计划（JSON模式）...")
     
     try:
+        import json
+        
         messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_message)
         ]
         
-        response = llm.invoke(messages)
+        # 调用LLM获取JSON响应
+        response = await llm.ainvoke(messages)
         response_text = response.content
         
         logger.info(f"LLM响应: {response_text[:200]}...")
         
-        # 解析JSON响应
-        # 尝试提取JSON（可能被包裹在```json```中）
+        # 提取JSON内容
         if "```json" in response_text:
             json_start = response_text.find("```json") + 7
             json_end = response_text.find("```", json_start)
@@ -232,26 +266,34 @@ PyQGIS API往往用于QGIS内部的图层以及可视化操作
         else:
             json_str = response_text.strip()
         
+        # 解析JSON
         plan_dict = json.loads(json_str)
         
-        # 转换为Plan对象
-        steps = [Step(**step) for step in plan_dict["steps"]]
+        # 转换为PlannerOutput对象（用于验证）
+        planner_output = PlannerOutput(
+            task=plan_dict["task"],
+            steps=[Step(**step) for step in plan_dict["steps"]],
+            metadata=plan_dict.get("metadata", {})
+        )
+        logger.info(f"JSON解析成功: {planner_output.task}")
         
         # 确保metadata包含必需字段
-        metadata = plan_dict.get("metadata", {})
+        metadata = planner_output.metadata.copy()
         metadata["iteration"] = retry_count + 1
         metadata["has_example_reference"] = has_example_reference
         
+        # 转换为Plan对象
         plan = Plan(
-            task=plan_dict["task"],
-            steps=steps,
+            task=planner_output.task,
+            steps=planner_output.steps,
             metadata=metadata
         )
         
         logger.info(f"生成计划成功: {plan.task}, 共{len(plan.steps)}个步骤")
         
         # 保存日志
-        save_execution_log(
+        await asyncio.to_thread(
+            save_execution_log,
             session_id,
             None,
             f"生成执行计划: {plan.task}",
@@ -279,7 +321,8 @@ PyQGIS API往往用于QGIS内部的图层以及可视化操作
         
     except Exception as e:
         logger.error(f"生成计划失败: {e}")
-        save_execution_log(
+        await asyncio.to_thread(
+            save_execution_log,
             session_id,
             None,
             f"生成计划失败: {str(e)}",

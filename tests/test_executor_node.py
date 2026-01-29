@@ -2,14 +2,18 @@
 """
 Executor Node测试
 """
-
+# 添加项目根目录到sys.path（必须在导入agent之前）
+import sys
+from pathlib import Path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
 import asyncio
 from dotenv import load_dotenv
 
 # 加载.env环境变量
 load_dotenv()
 
-from agent.state import create_initial_state, Plan, Step, StepContext, RelevantDoc
+from agent.state import create_initial_state, Plan, Step, StepContext
 from agent.nodes.executor_node import executor_node
 
 
@@ -40,36 +44,33 @@ async def test_executor_node():
     
     state["plan"] = plan
     state["status"] = True
-    state["current_step_id"] = 0
     state["api_context_structured"] = [
         StepContext(
             step_id=1,
             relevant_docs=[]
         )
     ]
+    state["tool_selection"] = None
     
-    # 调用Executor Node
+    # 调用Executor Revise Node
     result = await executor_node(state)
     
-    print("\nExecutor结果:")
-    print(f"- 当前步骤ID: {result.get('current_step_id')}")
-    print(f"- 重试次数: {result.get('retry_attempts')}")
-    print(f"- 执行日志数: {len(result.get('execution_logs', []))}")
-    print(f"- 代码历史数: {len(result.get('code_history', []))}")
-    
-    if result.get('execution_logs'):
-        for log in result['execution_logs']:
-            print(f"\n步骤 {log.get('step_id')}: {log.get('status')}")
-            if log.get('code'):
-                print(f"代码:\n{log['code'][:100]}...")
-            if log.get('error_detail'):
-                print(f"错误: {log['error_detail']}")
-    
-    print("\n✅ Executor Node测试通过")
+    print("\nExecutor Revise 结果:")
+    messages = result.get("messages", [])
+    print(f"- 消息数量: {len(messages)}")
+    print(f"- 截图路径: {result.get('screenshot_path')}")
+
+    if messages:
+        last_msg = messages[-1]
+        content = getattr(last_msg, "content", None)
+        if content:
+            print(f"- 最后一条消息: {content[:200]}...")
+
+    print("\n✅ Executor Revise Node测试通过")
 
 
 if __name__ == "__main__":
-    print("运行Executor Node测试...")
+    print("运行Executor Revise Node测试...")
     print("注意: 需要设置OPENAI_API_KEY环境变量")
     print("注意: 需要QGIS MCP插件和MCP Server运行")
     print("=" * 60)

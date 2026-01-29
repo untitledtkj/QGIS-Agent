@@ -70,10 +70,8 @@ class AgentState(TypedDict):
     
     # ========== Executor Node 字段 ==========
     messages: Annotated[list, add_messages]  # 包含AI思考、代码输出及执行结果
-    current_step_id: int              # 当前正在执行的步骤索引
-    execution_logs: List[Dict[str, Any]]  # 记录每步的成功/失败状态
-    code_history: List[str]           # 每步生成的代码历史
-    retry_attempts: int               # 当前步骤的自我纠错次数（最多3次）
+    screenshot_path: Optional[str]    # 最新生成的截图文件路径
+
     
     # ========== Reflector Node 字段 ==========
     final_summary: Optional[str]      # 任务完成后的总结
@@ -116,14 +114,11 @@ def create_initial_state(session_id: str, input_query: str) -> AgentState:
         
         # Executor字段
         messages=[],
-        current_step_id=0,
-        execution_logs=[],
-        code_history=[],
-        retry_attempts=0,
+        screenshot_path=None,
+
         
         # Reflector字段
         final_summary=None,
-        screenshot_path=None,
         is_completed=False,
         quality_score=0.0,
     )

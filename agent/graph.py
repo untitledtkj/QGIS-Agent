@@ -5,24 +5,25 @@ LangGraph 构建模块
 """
 
 import os
+import asyncio
 from typing import Optional, Literal
 from dotenv import load_dotenv
 
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.postgres import PostgresSaver
-from psycopg_pool import ConnectionPool
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg_pool import AsyncConnectionPool
 
 from agent.state import AgentState
 from agent.nodes.planner_node import planner_node
 from agent.nodes.api_rag_node import api_rag_node
 from agent.nodes.executor_node import executor_node
-from agent.nodes.reflector_node import reflector_node_sync
+from agent.nodes.reflector_node import reflector_node
 from agent.observability import configure_langsmith
 
 load_dotenv()
 
 
-def human_review_node(state: AgentState) -> dict:
+async def human_review_node(state: AgentState) -> dict:
     """
     人工审核节点
     这是一个中断点，等待外部输入审核结果
@@ -99,34 +100,34 @@ def should_continue_after_review(state: AgentState) -> Literal["api_rag_node", "
     return "planner_node"
 
 
-def should_continue_execution(state: AgentState) -> Literal["reflector_node", "executor_node"]:
-    """
-    判断执行是否完成，是否需要继续执行下一步
+# def should_continue_execution(state: AgentState) -> Literal["reflector_node", "executor_node"]:
+#     """
+#     判断执行是否完成，是否需要继续执行下一步
     
-    逻辑:
-    - 如果current_step_id >= 步骤总数，进入Reflector
-    - 否则继续执行下一步
+#     逻辑:
+#     - 如果current_step_id >= 步骤总数，进入Reflector
+#     - 否则继续执行下一步
     
-    Args:
-        state: 当前状态
+#     Args:
+#         state: 当前状态
         
-    Returns:
-        下一个节点名称
-    """
-    plan = state.get("plan")
-    if not plan:
-        return "reflector_node"
+#     Returns:
+#         下一个节点名称
+#     """
+#     plan = state.get("plan")
+#     if not plan:
+#         return "reflector_node"
     
-    current_step = state.get("current_step_id", 0)
-    total_steps = len(plan.steps) if hasattr(plan, 'steps') else 0
+#     current_step = state.get("current_step_id", 0)
+#     total_steps = len(plan.steps) if hasattr(plan, 'steps') else 0
     
-    if current_step >= total_steps:
-        return "reflector_node"
-    return "executor_node"
+#     if current_step >= total_steps:
+#         return "reflector_node"
+#     return "executor_node"
 
 
 def build_graph(
-    checkpointer: Optional[PostgresSaver] = None,
+    checkpointer: Optional[AsyncPostgresSaver] = None,
     interrupt_before: Optional[list] = None,
     interrupt_after: Optional[list] = None
 ) -> StateGraph:
@@ -159,7 +160,7 @@ def build_graph(
     workflow.add_node("human_review_node", human_review_node)  # 新增：人工审核节点
     workflow.add_node("api_rag_node", api_rag_node)
     workflow.add_node("executor_node", executor_node)
-    workflow.add_node("reflector_node", reflector_node_sync)
+    workflow.add_node("reflector_node", reflector_node)
     
     # 设置入口点
     workflow.set_entry_point("planner_node")
@@ -189,15 +190,8 @@ def build_graph(
     # API RAG -> Executor（直连）
     workflow.add_edge("api_rag_node", "executor_node")
     
-    # Executor -> 条件判断 -> 继续执行或进入Reflector
-    workflow.add_conditional_edges(
-        "executor_node",
-        should_continue_execution,
-        {
-            "executor_node": "executor_node",  # 循环执行下一步
-            "reflector_node": "reflector_node"
-        }
-    )
+    # Executor -> Reflector（执行结束直接进入Reflector）
+    workflow.add_edge("executor_node", "reflector_node")
     
     # Reflector -> END（任务完成）
     workflow.add_edge("reflector_node", END)
@@ -211,6 +205,9 @@ def build_graph(
             interrupt_before = ["human_review_node"]
         if interrupt_before:
             compile_kwargs["interrupt_before"] = interrupt_before
+        # 默认在executor_node之后中断（如果未指定）
+        if interrupt_after is None:
+            interrupt_after = ["executor_node"]
         if interrupt_after:
             compile_kwargs["interrupt_after"] = interrupt_after
         app = workflow.compile(**compile_kwargs)
@@ -220,7 +217,7 @@ def build_graph(
     return app
 
 
-def create_checkpointer() -> PostgresSaver:
+async def create_checkpointer() -> AsyncPostgresSaver:
     """
     创建PostgreSQL checkpointer用于状态持久化
     
@@ -229,18 +226,18 @@ def create_checkpointer() -> PostgresSaver:
     """
     db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/qgis_db")
     
-    pool = ConnectionPool(
+    pool = AsyncConnectionPool(
         conninfo=db_url,
         max_size=10
     )
+    await pool.open()
     
-    checkpointer = PostgresSaver(pool)
-    checkpointer.setup()  # 创建必要的表结构
-    
+    checkpointer = AsyncPostgresSaver(pool)
+    await checkpointer.setup()  # 创建必要的表结构
     return checkpointer
 
 
-def get_graph(
+async def get_graph(
     with_checkpointer: bool = True,
     interrupt_before: list = None,
     interrupt_after: list = None,
@@ -259,9 +256,9 @@ def get_graph(
     """
     configure_langsmith()
     if with_checkpointer:
-        checkpointer = create_checkpointer()
+        checkpointer = await create_checkpointer()
         if reset_thread_id:
-            checkpointer.delete_thread(reset_thread_id)
+            await checkpointer.adelete_thread(reset_thread_id)
         return build_graph(checkpointer, interrupt_before=interrupt_before, interrupt_after=interrupt_after)
     else:
         return build_graph(interrupt_before=interrupt_before, interrupt_after=interrupt_after)
@@ -270,7 +267,7 @@ def get_graph(
 if __name__ == "__main__":
     # 测试Graph构建
     print("Building LangGraph...")
-    app = get_graph(with_checkpointer=False)
+    app = asyncio.run(get_graph(with_checkpointer=False))
     print("Graph built successfully!")
     print("\nGraph structure:")
     print(app.get_graph().draw_mermaid())

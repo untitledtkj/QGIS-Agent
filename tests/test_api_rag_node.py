@@ -3,8 +3,18 @@
 API RAG Node测试
 """
 
+# 添加项目根目录到sys.path（必须在导入agent之前）
+import sys
+from pathlib import Path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+
 from agent.state import create_initial_state, Plan, Step
 from agent.nodes.api_rag_node import api_rag_node
+
+
+
 
 
 def test_api_rag_node():
@@ -75,7 +85,7 @@ def test_api_rag_node():
         for i, doc in enumerate(result.get('pyqgis_doc', []), 1):
             print(f"\n{i}. API名称: {doc['api_name']}")
             print(f"   库: {doc.get('library', 'PyQGIS')}")
-            print(f"   描述: {doc.get('description', 'N/A')[:100]}...")
+            print(f"   内容: {doc.get('content', 'N/A')[:100]}...")
     
     # 打印步骤分组详情
     print("\n" + "=" * 60)

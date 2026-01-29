@@ -7,6 +7,7 @@ Agent Graph人工测试脚本
 import sys
 import os
 import json
+import asyncio
 from typing import Optional
 
 # 添加项目根目录到路径
@@ -87,7 +88,24 @@ def review_result(state):
     input("\n按Enter键结束...")
 
 
-def run_agent(user_query: str):
+def review_execution() -> bool:
+    """让用户确认本次任务是否成功"""
+    print("\n" + "="*60)
+    print("✅ 执行结果确认")
+    print("="*60)
+    print("\n请选择:")
+    print("1. 任务成功")
+    print("2. 任务失败")
+    while True:
+        choice = input("\n请输入选择 (1/2): ").strip()
+        if choice == "1":
+            return True
+        if choice == "2":
+            return False
+        print("请输入 1 或 2")
+
+
+async def run_agent(user_query: str):
     """
     运行Agent处理用户查询（支持HITL）
     
@@ -102,8 +120,9 @@ def run_agent(user_query: str):
     # 1. 构建Graph（启用checkpointer支持HITL）
     print("1. 构建Graph...")
     try:
-        app = get_graph(
+        app = await get_graph(
             with_checkpointer=True,
+            interrupt_after=["executor_node"],
             reset_thread_id="demo_thread"
         )
         print("   ✅ Graph构建成功（已启用状态持久化和人工审核）\n")
@@ -144,7 +163,7 @@ def run_agent(user_query: str):
             final_state = None
             interrupted = False
             
-            for chunk in app.stream(current_state, config, stream_mode="values"):
+            async for chunk in app.astream(current_state, config, stream_mode="values"):
                 final_state = chunk
                 
                 # 显示Planner进度
@@ -185,7 +204,7 @@ def run_agent(user_query: str):
                 if approved:
                     # 批准计划
                     print("\n✅ 计划已批准\n")
-                    app.update_state(
+                    await app.aupdate_state(
                         config,
                         {
                             "plan": final_state["draft"],
@@ -196,12 +215,11 @@ def run_agent(user_query: str):
                     # 需要修改
                     print(f"\n📝 修改意见: {advise}")
                     retry_count = final_state.get("retry_count", 0)
-                    app.update_state(
+                    await app.aupdate_state(
                         config,
                         {
                             "advise": advise,
                             "status": False,
-                            "draft": None,
                             "retry_count": retry_count + 1
                         }
                     )
@@ -209,9 +227,24 @@ def run_agent(user_query: str):
                 
                 # 继续执行
                 current_state = None
-            else:
-                # 没有中断，执行完成
-                break
+            # 检查是否在executor_node后中断
+            elif final_state and final_state.get("messages") and not final_state.get("final_summary"):
+                interrupted = True
+                print("\n⏸️  到达中断点：执行结果审核")
+                is_completed = review_execution()
+                await app.aupdate_state(
+                    config,
+                    {
+                        "is_completed": is_completed
+                    }
+                )
+                print("\n✅ 已记录执行结果\n")
+                # 继续执行
+                current_state = None
+            if interrupted:
+                continue
+            # 没有中断，执行完成
+            break
         
         # 显示最终结果
         if final_state:
@@ -235,6 +268,8 @@ def run_agent(user_query: str):
 
 def main():
     """主函数"""
+    if os.name == "nt":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     print("\n" + "="*60)
     print("QGIS Agent Demo - HITL模式")
     print("="*60)
@@ -242,6 +277,7 @@ def main():
     print("  Planner → Human Review → API RAG → Executor → Reflector")
     print("\nHITL暂停点:")
     print("  🔄 在Human Review节点前自动中断，等待人工审核")
+    print("  🔄 在Executor节点后自动中断，确认执行结果")
     print("\n功能特性:")
     print("  ✓ 人工审核计划（由Graph自动管理流程）")
     print("  ✓ 提供修改意见")
@@ -273,7 +309,7 @@ def main():
         print(f"使用默认查询: {query}")
     
     # 运行Agent
-    run_agent(query)
+    asyncio.run(run_agent(query))
 
 
 if __name__ == "__main__":

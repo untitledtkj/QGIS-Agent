@@ -18,26 +18,19 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-QGIS_MCP_SERVER_URL = os.getenv("QGIS_MCP_SERVER_URL", "http://localhost:8000")
-QGIS_MCP_SSE_URL = os.getenv("QGIS_MCP_SSE_URL")
-
-
-def _normalize_sse_url(server_url: str) -> str:
-    if server_url.endswith("/sse"):
-        return server_url
-    return server_url.rstrip("/") + "/sse"
+QGIS_MCP_SERVER_URL = os.getenv("QGIS_MCP_SERVER_URL", "http://localhost:8002/mcp")
 
 
 class QGISMCPClient:
     """极简 MCP 客户端（供 Agent 使用）"""
 
-    def __init__(self, sse_url: str):
-        self.sse_url = sse_url
+    def __init__(self, url: str):
+        self.url = url
         self._client = MultiServerMCPClient(
             {
                 "qgis": {
-                    "transport": "sse",
-                    "url": sse_url,
+                    "transport": "http",
+                    "url": self.url,
                 }
             }
         )
@@ -94,8 +87,8 @@ async def get_mcp_client() -> QGISMCPClient:
     global _mcp_client
     async with _client_lock:
         if _mcp_client is None:
-            sse_url = QGIS_MCP_SSE_URL or _normalize_sse_url(QGIS_MCP_SERVER_URL)
-            _mcp_client = QGISMCPClient(sse_url=sse_url)
+            url = QGIS_MCP_SERVER_URL
+            _mcp_client = QGISMCPClient(url=url)
         return _mcp_client
 
 

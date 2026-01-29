@@ -14,8 +14,12 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from agent.state import AgentState, RelevantDoc, StepContext
-from agent.tools.rag import search_gdal_docs, search_gdal_docs_fuzzy, search_pyqgis_docs
+
 from agent.tools.database import save_execution_log
+
+import asyncio
+from agent.tools.mcp_client import get_mcp_client
+
 
 load_dotenv()
 
@@ -30,7 +34,8 @@ llm = ChatOpenAI(
 )
 
 
-def api_rag_node(state: AgentState) -> Dict[str, Any]:
+
+async def api_rag_node(state: AgentState) -> Dict[str, Any]:
     """
     API RAG检索节点 - 检索并结构化API文档
     
@@ -64,7 +69,8 @@ def api_rag_node(state: AgentState) -> Dict[str, Any]:
         }
     
     # 保存日志
-    save_execution_log(
+    await asyncio.to_thread(
+        save_execution_log,
         session_id,
         None,
         "开始检索API文档",
@@ -85,37 +91,41 @@ def api_rag_node(state: AgentState) -> Dict[str, Any]:
     
     logger.info(f"需要检索的API: GDAL={len(all_gdal_apis)}, PyQGIS={len(all_pyqgis_apis)}")
     
-    # 2. 检索API文档（精确搜索，失败则降级到模糊搜索）
-    # Planner现在会输出完整的API格式（如osgeo.gdal.Warp），所以可以直接精确搜索
     gdal_docs = []
     pyqgis_docs = []
     found_gdal_apis = set()
     found_pyqgis_apis = set()
+
+    client = await get_mcp_client()
     
     if all_gdal_apis:
         # 先尝试精确搜索
-        gdal_docs = search_gdal_docs(all_gdal_apis)
+        raw_result = await client.call_tool("search_gdal_api", {"api_names": all_gdal_apis})
+        
+        # 解析 MCP 返回结果
+        if isinstance(raw_result, list) and len(raw_result) > 0:
+            # 提取第一个消息的 text 字段
+            result_text = raw_result[0].get('text', '{}')
+            result_data = json.loads(result_text)
+            gdal_docs = result_data.get('results', [])
+        else:
+            gdal_docs = []
+        
         logger.info(f"精确搜索找到GDAL文档: {len(gdal_docs)}个")
         for doc in gdal_docs:
             found_gdal_apis.add(doc["api_name"])
         
-        # 对于未找到的API，尝试模糊搜索
-        not_found_gdal = set(all_gdal_apis) - found_gdal_apis
-        if not_found_gdal:
-            logger.info(f"对{len(not_found_gdal)}个未找到的GDAL API尝试模糊搜索...")
-            for api_name in not_found_gdal:
-                # 提取API名称的最后部分作为搜索关键词（如Warp, Translate等）
-                search_key = api_name.split('.')[-1]
-                fuzzy_results = search_gdal_docs_fuzzy(search_key, limit=3)
-                if fuzzy_results:
-                    # 选择相似度最高的结果
-                    best_match = fuzzy_results[0]
-                    logger.info(f"模糊搜索: '{api_name}' -> '{best_match['api_name']}' (相似度={best_match.get('sim_score', 0):.2f})")
-                    gdal_docs.append(best_match)
-                    found_gdal_apis.add(best_match["api_name"])
-    
     if all_pyqgis_apis:
-        pyqgis_docs = search_pyqgis_docs(all_pyqgis_apis)
+        raw_result = await client.call_tool("search_pyqgis_api", {"api_names": all_pyqgis_apis})
+        
+        # 解析 MCP 返回结果
+        if isinstance(raw_result, list) and len(raw_result) > 0:
+            result_text = raw_result[0].get('text', '{}')
+            result_data = json.loads(result_text)
+            pyqgis_docs = result_data.get('results', [])
+        else:
+            pyqgis_docs = []
+            
         logger.info(f"找到PyQGIS文档: {len(pyqgis_docs)}个")
         for doc in pyqgis_docs:
             found_pyqgis_apis.add(doc["api_name"])
@@ -127,7 +137,8 @@ def api_rag_node(state: AgentState) -> Dict[str, Any]:
     
     if missing_deps:
         logger.warning(f"缺失的API文档: {missing_deps}")
-        save_execution_log(
+        await asyncio.to_thread(
+            save_execution_log,
             session_id,
             None,
             f"缺失API文档: {', '.join(missing_deps)}",
@@ -145,7 +156,7 @@ def api_rag_node(state: AgentState) -> Dict[str, Any]:
         # 构建API摘要
         api_summary = "\n".join([
             f"- {doc['api_name']}: {doc.get('description', 'N/A')[:100]}..."
-            for doc in gdal_docs[:5]  # 只分析前5个，避免token过多
+            for doc in gdal_docs[:3]  # 只分析前5个，避免token过多
         ])
         
         reflection_prompt = f"""分析以下GDAL API，判断是否还需要其他辅助类或配置类才能正常使用。
@@ -166,7 +177,7 @@ def api_rag_node(state: AgentState) -> Dict[str, Any]:
 示例输出: ["osgeo.gdal.WarpOptions", "osgeo.gdal.TranslateOptions"]"""
 
         try:
-            response = llm.invoke([HumanMessage(content=reflection_prompt)])
+            response = await llm.ainvoke([HumanMessage(content=reflection_prompt)])
             response_text = response.content.strip()
             
             # 尝试解析JSON
@@ -180,7 +191,8 @@ def api_rag_node(state: AgentState) -> Dict[str, Any]:
                     logger.info(f"LLM识别出需要补充的依赖: {additional_deps}")
                     
                     # 使用精确搜索查找补充依赖
-                    supplemental_docs = search_gdal_docs(additional_deps)
+                    supplemental_docs = await client.call_tool("search_gdal_api", {"method_names": additional_deps})
+                    
                     if supplemental_docs:
                         logger.info(f"补充检索到 {len(supplemental_docs)} 个依赖文档")
                         # 将补充文档也添加到gdal_docs中（用于后续可能的使用）
@@ -195,6 +207,20 @@ def api_rag_node(state: AgentState) -> Dict[str, Any]:
     
     # 准备补充文档列表（用于所有步骤共享）
     supplemental_relevant_docs = []
+    if additional_deps:
+        logger.info(f"LLM识别出需要补充的依赖: {additional_deps}")
+        
+        # 使用精确搜索查找补充依赖
+        raw_result = await client.call_tool("search_gdal_api", {"api_names": additional_deps})
+        
+        # 解析结果
+        if isinstance(raw_result, list) and len(raw_result) > 0:
+            result_text = raw_result[0].get('text', '{}')
+            result_data = json.loads(result_text)
+            supplemental_docs = result_data.get('results', [])
+        else:
+            supplemental_docs = []
+
     if supplemental_docs:
         for doc in supplemental_docs:
             content_parts = [
@@ -216,6 +242,10 @@ def api_rag_node(state: AgentState) -> Dict[str, Any]:
         step_docs = []
         
         # 添加该步骤的GDAL文档
+        # mcp返回格式：
+        """
+         {"api_name" ,"description" , "params", "example_code", "library":}
+        """
         for api_name in step.gdal_api:
             # 精确匹配（Planner现在输出完整格式，应该能直接匹配）
             matching_docs = [doc for doc in gdal_docs if doc["api_name"] == api_name]
@@ -236,14 +266,18 @@ def api_rag_node(state: AgentState) -> Dict[str, Any]:
                 ))
         
         # 添加该步骤的PyQGIS文档
+        # mcp返回格式：
+        """
+         {"api_name" ,"content" , "source_url", "base_class(optional)", "signature", "methods(optional)"}
+         class api和method api返回格式不一样，只有api_name和content是共通的
+        """
         for api_name in step.pyqgis_api:
             # 精确匹配
             matching_docs = [doc for doc in pyqgis_docs if doc["api_name"] == api_name]
             for doc in matching_docs:
                 content_parts = [
                     f"API名称: {doc['api_name']}",
-                    f"描述: {doc['description']}",
-                    f"参数:\n{doc['params']}",
+                    f"内容: {doc['content']}",
                 ]
                 if doc.get('example_code'):
                     content_parts.append(f"示例代码:\n```python\n{doc['example_code']}\n```")
@@ -263,7 +297,8 @@ def api_rag_node(state: AgentState) -> Dict[str, Any]:
         logger.info(f"步骤{step.step_id}: 检索到{len(step_docs)}个API文档")
     
     # 5. 保存日志
-    save_execution_log(
+    await asyncio.to_thread(
+        save_execution_log,
         session_id,
         None,
         f"API文档检索完成: GDAL={len(gdal_docs)}, PyQGIS={len(pyqgis_docs)}",
