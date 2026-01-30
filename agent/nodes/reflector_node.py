@@ -55,6 +55,7 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     
     session_id = state["session_id"]
     input_query = state["input_query"]
+    prior_log_summary = state.get("log_summary")
     plan = state.get("plan")
     messages = state.get("messages", [])
     execution_logs = state.get("execution_logs", [])
@@ -196,7 +197,7 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     logger.info(f"任务完成状态（由用户确认或默认判断）: {is_completed}")
     
     # 5. 归档到Cookbook（技术文档要求: quality_score > 0.6）
-    if is_completed and quality_score > 0.6:
+    if is_completed and quality_score > 0.7:
         logger.info("任务质量达标，归档到Cookbook...")
         
         # 合并所有成功步骤的代码
@@ -227,11 +228,8 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
                 verified_code=verified_code,
                 tags=tags,
                 complexity_score=complexity_score,
-                metadata={
-                    "session_id": session_id,
-                    "total_steps": total_steps,
-                    "quality_score": quality_score,
-                }
+                steps={step.step_id: step.description for step in plan.steps} if plan else {}
+
             )
             
             if entry_id:
@@ -306,12 +304,16 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     #            advise, retry_count, status, example, missing_deps, messages, quality_score
     logger.info("执行状态清理...")
     
+    combined_log_summary = (
+        f"{prior_log_summary}\n\n{final_summary}" if prior_log_summary else final_summary
+    )
+
     cleaned_state = {
         # 保留字段
-        "final_summary": final_summary,
-        "log_summary": final_summary,  # 用于下一轮Planner的上下文
+        "final_summary": None,
+        "log_summary": combined_log_summary,  # 用于下一轮Planner的上下文
         "screenshot_path": screenshot_path,
-        "is_completed": is_completed,  # 待HITL实现后改为人工确认
+        "is_completed": False,  # 待HITL实现后改为人工确认
         
         # 清理的字段（重置为初始值）
         "draft": None,

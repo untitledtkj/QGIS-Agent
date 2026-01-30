@@ -62,7 +62,7 @@ def should_continue_planning(state: AgentState) -> Literal["human_review_node", 
         return "api_rag_node"
     
     # 检查重试上限（强制退出）
-    if state.get("retry_count", 0) >= 3:
+    if state.get("retry_count", 0) >= 5:
         return "api_rag_node"
     
     # 如果生成了draft但未审核，进入人工审核

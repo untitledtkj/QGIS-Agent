@@ -105,57 +105,116 @@ def review_execution() -> bool:
         print("请输入 1 或 2")
 
 
-async def run_agent(user_query: str):
+def ask_next_round() -> bool:
+    """询问是否继续下一轮对话"""
+    print("\n是否开始下一轮对话?")
+    print("1. 是")
+    print("2. 否")
+    while True:
+        choice = input("\n请输入选择 (1/2): ").strip()
+        if choice == "1":
+            return True
+        if choice == "2":
+            return False
+        print("请输入 1 或 2")
+
+
+async def run_agent(user_query: str, reset_thread: bool = False) -> Optional[dict]:
     """
     运行Agent处理用户查询（支持HITL）
-    
+
     Args:
         user_query: 用户的GIS任务需求
+        reset_thread: 是否重置thread（仅第一轮为True）
     """
     print("\n" + "="*60)
     print("QGIS Agent启动（HITL模式）")
     print("="*60)
     print(f"\n用户查询: {user_query}\n")
-    
+
     # 1. 构建Graph（启用checkpointer支持HITL）
     print("1. 构建Graph...")
     try:
+        # 只在第一轮重置thread，后续轮次保留之前的状态
+        reset_thread_id = "demo_thread" if reset_thread else None
         app = await get_graph(
             with_checkpointer=True,
             interrupt_after=["executor_node"],
-            reset_thread_id="demo_thread"
+            reset_thread_id=reset_thread_id
         )
         print("   ✅ Graph构建成功（已启用状态持久化和人工审核）\n")
     except Exception as e:
         print(f"   ❌ Graph构建失败: {e}")
         print("\n提示: 请确保PostgreSQL数据库正在运行")
-        return
-    
-    # 2. 创建初始状态
-    print("2. 创建初始状态...")
-    initial_state = create_initial_state(
-        session_id="demo_session",
-        input_query=user_query
-    )
-    print(f"   ✅ Session ID: {initial_state['session_id']}\n")
-    
-    
-    # 4. 执行Graph（支持HITL）
-    print("\n" + "="*60)
-    print("开始执行Graph（HITL模式）")
-    print("="*60 + "\n")
-    
+        return None
+
+    # 2. 准备状态（尝试复用上一轮状态）
+    print("2. 准备状态...")
+
     config = {
         "configurable": {
             "thread_id": "demo_thread"
         }
     }
-    
+
+    # 尝试获取之前的checkpoint状态
+    try:
+        state_snapshot = await app.aget_state(config)
+        if state_snapshot and state_snapshot.values:
+            # 复用之前的状态，但需要清除表示"已完成"的字段
+            current_state = state_snapshot.values.copy()
+            current_state["input_query"] = user_query
+
+            # 清除上一轮执行产生的字段，让Graph重新执行完整流程
+            # 保留: log_summary（用于Planner上下文）、session_id
+            # 清除: final_summary, messages, plan, draft等执行相关字段
+            current_state.pop("final_summary", None)
+            current_state.pop("messages", None)
+            current_state.pop("plan", None)
+            current_state.pop("draft", None)
+            current_state.pop("status", False)
+            current_state.pop("advise", None)
+            current_state.pop("example", None)
+            current_state.pop("api_context_structured", None)
+            current_state.pop("gdal_doc", None)
+            current_state.pop("pyqgis_doc", None)
+            current_state.pop("execution_logs", None)
+            current_state.pop("screenshot_path", None)
+            current_state.pop("current_step_id", 0)
+            current_state.pop("is_completed", False)
+            current_state.pop("retry_count", 0)
+
+            log_summary_preview = current_state.get('log_summary', 'None')
+            preview = log_summary_preview[:50] if log_summary_preview else 'None'
+            print(f"   ✅ 复用上一轮状态（已清理执行相关字段）")
+            print(f"   📝 log_summary: {preview}...")
+        else:
+            # 没有之前的状态，创建新状态
+            current_state = create_initial_state(
+                session_id="demo_session",
+                input_query=user_query
+            )
+            print(f"   ✅ 创建新状态")
+            print(f"   🆕 Session ID: {current_state['session_id']}")
+    except Exception as e:
+        import logging
+        logging.warning(f"获取之前状态失败，创建新状态: {e}")
+        current_state = create_initial_state(
+            session_id="demo_session",
+            input_query=user_query
+        )
+        print(f"   ✅ 创建新状态（获取历史状态失败）")
+        print(f"   🆕 Session ID: {current_state['session_id']}")
+
+    # 4. 执行Graph（支持HITL）
+    print("\n" + "="*60)
+    print("开始执行Graph（HITL模式）")
+    print("="*60 + "\n")
+
     try:
         # 执行流程：Graph会自动管理人工审核流程
         print("🚀 开始执行...\n")
-        
-        current_state = initial_state
+
         last_step = -1
         
         # Stream执行，遇到人工审核节点时自动中断
@@ -199,7 +258,7 @@ async def run_agent(user_query: str):
                 if advise is None and not approved:
                     # 用户选择放弃
                     print("\n任务已取消")
-                    return
+                    return None
                 
                 if approved:
                     # 批准计划
@@ -228,6 +287,7 @@ async def run_agent(user_query: str):
                 # 继续执行
                 current_state = None
             # 检查是否在executor_node后中断
+            
             elif final_state and final_state.get("messages") and not final_state.get("final_summary"):
                 interrupted = True
                 print("\n⏸️  到达中断点：执行结果审核")
@@ -253,6 +313,7 @@ async def run_agent(user_query: str):
         print("\n" + "="*60)
         print("执行完成")
         print("="*60)
+        return final_state
         
     except Exception as e:
         print(f"\n❌ 执行失败: {e}")
@@ -264,6 +325,7 @@ async def run_agent(user_query: str):
         print("- QGIS MCP服务器未运行")
         print("- LLM API密钥未设置或无效")
         print("- GDAL文档未导入到数据库")
+        return None
 
 
 def main():
@@ -308,8 +370,25 @@ def main():
         query = examples[0]
         print(f"使用默认查询: {query}")
     
-    # 运行Agent
-    asyncio.run(run_agent(query))
+    # 多轮对话
+    current_query = query
+    is_first_round = True
+    while True:
+        final_state = asyncio.run(run_agent(current_query, reset_thread=is_first_round))
+        if not final_state:
+            break
+        if not ask_next_round():
+            break
+        print("\n请输入下一轮GIS任务需求（或输入数字选择示例）:")
+        user_input = input("> ").strip()
+        if user_input.isdigit() and 1 <= int(user_input) <= len(examples):
+            current_query = examples[int(user_input) - 1]
+        elif user_input:
+            current_query = user_input
+        else:
+            current_query = examples[0]
+            print(f"使用默认查询: {current_query}")
+        is_first_round = False  # 后续轮次不复位thread，保留状态
 
 
 if __name__ == "__main__":

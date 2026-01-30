@@ -16,7 +16,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from agent.state import AgentState, Plan, Step
-from agent.tools.rag import search_cookbook
+from agent.tools.mcp_client import get_mcp_client
+from agent.tools.rag import _extract_mcp_response_data
 from agent.tools.database import save_execution_log
 
 load_dotenv()
@@ -80,24 +81,17 @@ SYSTEM_PROMPT_TEMPLATE = Template("""你是一个专业的QGIS地理数据处理
 ## API使用与命名规范（重要）
 请务必使用**完整的API名称格式**：
 
-GDAL API往往用于数据处理
-常用GDAL API示例：
-- 打开文件: osgeo.gdal.Open, osgeo.ogr.Open
-- 影像处理: osgeo.gdal.Warp, osgeo.gdal.Translate
-- 创建数据集: osgeo.gdal.GetDriverByName
+GDAL API往往用于数据处理，PyQGIS API往往用于QGIS内部的图层以及可视化操作
 
-PyQGIS API往往用于QGIS内部的图层以及可视化操作
-常用PyQGIS API示例：
-- 图层操作: QgsVectorLayer, QgsRasterLayer
-- 项目管理: QgsProject
-- 几何操作: QgsGeometry
 
 ## 注意事项
-1. 步骤不要拆分太细，每个步骤应该是中低复杂度的目标，且涉及文件必须包含路径信息
-2. 文件的导入与导出不要使用GDAL或者PYQGIS的代码，只需在步骤中api留空
-3. gdal_api和pyqgis_api列出所有可能用到的API名称（不需要参数细节），如果该步骤不需要使用某类API，可以留空
-4. 参考相似案例可以提高准确性
-5. 必须返回有效的JSON格式，不要添加任何额外的解释文字
+1. 如果有用户修改意见，请结合意见进行调整
+2. 如果有上一轮的执行总结，先了解之前内容是否成功执行，若成功则无需重复步骤
+3. 步骤不要拆分太细，每个步骤应该是中低复杂度的目标，且涉及文件必须包含路径信息
+4. 文件的导入与导出不要使用GDAL或者PYQGIS的代码，只需在步骤中api留空
+5. gdal_api和pyqgis_api列出所有可能用到的API名称，尽量精确到方法级别（不需要参数细节），如果该步骤不需要使用某类API，可以留空
+6. 参考相似案例可以提高准确性
+7. 必须返回有效的JSON格式，不要添加任何额外的解释文字
 """)
 
 # 定义User Message模板
@@ -215,15 +209,29 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
     has_example_reference = False
     
     if retry_count == 0 and not advise:
-        logger.info("检索Cookbook相似案例...")
-        cookbook_results = search_cookbook(search_query, similarity_threshold=0.3, top_k=3)
-        
+        logger.info("通过MCP检索Cookbook相似案例...")
+        try:
+            mcp_client = await get_mcp_client()
+            mcp_result = await mcp_client.call_tool(
+                "search_qgis_cookbook",
+                {
+                    "user_intent": search_query,
+                    "similarity_threshold": 0.3,
+                    "top_k": 3
+                }
+            )
+            response_data = _extract_mcp_response_data(mcp_result) or {}
+            cookbook_results = response_data.get("results", [])
+        except Exception as e:
+            logger.warning(f"MCP检索Cookbook失败: {e}")
+            cookbook_results = []
+
         if cookbook_results:
             # 使用Top-3案例
             examples_list = cookbook_results
             example = cookbook_results[0]  # 主要参考最相似的案例（保留此字段用于State兼容）
             has_example_reference = True
-            logger.info(f"找到{len(cookbook_results)}个相似案例，Top-1: {example['user_intent'][:50]}... (相似度: {example['similarity_score']:.2f})")
+            logger.info(f"找到{len(cookbook_results)}个相似案例，Top-1: {example['user_intent'][:50]}... (相似度: {example.get('similarity_score', 0.0):.2f})")
         else:
             logger.info("未找到相似案例")
     

@@ -75,6 +75,7 @@ class AgentState(TypedDict):
     
     # ========== Reflector Node 字段 ==========
     final_summary: Optional[str]      # 任务完成后的总结
+    log_summary: Optional[str]        # 之前轮次的任务执行总结
     screenshot_path: Optional[str]    # 最新生成的截图文件路径
     is_completed: bool                # 用户人工认定的任务成功完成状态
     quality_score: float              # LLM对本次任务的价值评分

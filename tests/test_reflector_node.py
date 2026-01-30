@@ -3,6 +3,13 @@
 Reflector Node测试
 """
 
+# 添加项目根目录到sys.path（必须在导入agent之前）
+import sys
+from pathlib import Path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+
 import asyncio
 from dotenv import load_dotenv
 
@@ -10,6 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from agent.state import create_initial_state, Plan, Step
+from langchain_core.messages import AIMessage
 from agent.nodes.reflector_node import reflector_node
 
 
@@ -34,27 +42,13 @@ async def test_reflector_node():
         metadata={"estimated_complexity": "low"}
     )
     
-    # 模拟执行日志
-    execution_logs = [
-        {
-            "step_id": 1,
-            "description": "加载shapefile",
-            "status": "success",
-            "code": "print('步骤1代码')",
-            "output": {"executed": True}
-        },
-        {
-            "step_id": 2,
-            "description": "显示图层",
-            "status": "success",
-            "code": "print('步骤2代码')",
-            "output": {"executed": True}
-        }
-    ]
-    
     state["plan"] = plan
-    state["execution_logs"] = execution_logs
-    state["code_history"] = ["print('步骤1代码')", "print('步骤2代码')"]
+    state["messages"] = [
+        AIMessage(content="步骤1: 使用QgsRasterLayer加载数据源 D:/data/sample.tif，图层命名为 sample_raster"),
+        AIMessage(content="步骤2: 将图层添加到QgsProject并刷新地图画布，检查坐标系为 EPSG:4326"),
+        AIMessage(content="结果: 图层加载成功，可视化正常，未出现错误")
+    ]
+    state["is_completed"] = True
     
     # 调用Reflector Node
     result = await reflector_node(state)
