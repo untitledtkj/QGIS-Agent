@@ -120,6 +120,6 @@ def create_initial_state(session_id: str, input_query: str) -> AgentState:
         
         # Reflector字段
         final_summary=None,
-        is_completed=False,
+        is_completed=None,
         quality_score=0.0,
     )

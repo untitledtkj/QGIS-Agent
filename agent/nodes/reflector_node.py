@@ -313,7 +313,7 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
         "final_summary": None,
         "log_summary": combined_log_summary,  # 用于下一轮Planner的上下文
         "screenshot_path": screenshot_path,
-        "is_completed": False,  # 待HITL实现后改为人工确认
+        "is_completed": is_completed,  # 待HITL实现后改为人工确认
         
         # 清理的字段（重置为初始值）
         "draft": None,
@@ -347,5 +347,3 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     
     return cleaned_state
 
-
-# 仅保留异步版本

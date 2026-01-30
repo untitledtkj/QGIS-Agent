@@ -296,4 +296,5 @@ async def _executor_revise_node_async(state: AgentState) -> Dict[str, Any]:
     return {
         "messages": messages,
         "screenshot_path": screenshot_path,
+        "is_completed": None  # TODO待HITL实现后改为人工确认,暂时确保运行
     }

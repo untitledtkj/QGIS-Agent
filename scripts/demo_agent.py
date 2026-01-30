@@ -183,6 +183,7 @@ async def run_agent(user_query: str, reset_thread: bool = False) -> Optional[dic
             current_state.pop("current_step_id", 0)
             current_state.pop("is_completed", False)
             current_state.pop("retry_count", 0)
+            # current_state["execution_reviewed"] = False
 
             log_summary_preview = current_state.get('log_summary', 'None')
             preview = log_summary_preview[:50] if log_summary_preview else 'None'
@@ -288,7 +289,7 @@ async def run_agent(user_query: str, reset_thread: bool = False) -> Optional[dic
                 current_state = None
             # 检查是否在executor_node后中断
             
-            elif final_state and final_state.get("messages") and not final_state.get("final_summary"):
+            elif final_state and final_state.get("messages") and not final_state.get("is_completed"):
                 interrupted = True
                 print("\n⏸️  到达中断点：执行结果审核")
                 is_completed = review_execution()
