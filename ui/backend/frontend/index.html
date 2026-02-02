@@ -84,12 +84,16 @@
         }
 
         .session-item {
-            padding: 12px;
+            padding: 10px 12px;
             margin: 5px 0;
             background: var(--bg-light);
             border-radius: 8px;
             cursor: pointer;
             transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
         }
 
         .session-item:hover {
@@ -109,6 +113,31 @@
             font-size: 0.75rem;
             color: var(--text-secondary);
             margin-top: 4px;
+        }
+
+        .session-info {
+            min-width: 0;
+        }
+
+        .session-actions {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            flex-shrink: 0;
+        }
+
+        .session-delete-btn {
+            background: transparent;
+            border: none;
+            color: var(--danger-color);
+            cursor: pointer;
+            font-size: 0.9rem;
+            padding: 4px 6px;
+            border-radius: 6px;
+        }
+
+        .session-delete-btn:hover {
+            background: rgba(239, 68, 68, 0.15);
         }
 
         /* 文件上传区 */
@@ -782,10 +811,45 @@
             container.innerHTML = sessions.map(session => `
                 <div class="session-item ${session.thread_id === currentThreadId ? 'active' : ''}"
                      onclick="switchSession('${session.thread_id}')">
-                    <div class="name">${session.name}</div>
-                    <div class="time">${formatTime(session.created_at)}</div>
+                    <div class="session-info">
+                        <div class="name">${session.name}</div>
+                        <div class="time">${formatTime(session.created_at)}</div>
+                    </div>
+                    <div class="session-actions">
+                        <button class="session-delete-btn" title="删除会话" onclick="deleteSession('${session.thread_id}', event)">🗑️</button>
+                    </div>
                 </div>
             `).join('');
+        }
+
+        async function deleteSession(threadId, event) {
+            if (event) {
+                event.stopPropagation();
+            }
+            if (!confirm('确认删除该会话吗？此操作不可恢复。')) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/sessions/${threadId}`, {
+                    method: 'DELETE'
+                });
+
+                if (response.ok) {
+                    if (currentThreadId === threadId) {
+                        currentThreadId = null;
+                        clearChat();
+                        addSystemMessage('会话已删除');
+                    }
+                    await loadSessions();
+                } else {
+                    const data = await response.json();
+                    addSystemMessage(`删除失败: ${data.detail || '未知错误'}`);
+                }
+            } catch (error) {
+                console.error('删除会话失败:', error);
+                addSystemMessage('删除会话失败，请稍后重试');
+            }
         }
 
         function switchSession(threadId) {

@@ -129,6 +129,62 @@ async def get_app_with_checkpointer():
     )
 
 
+async def fetch_checkpoint_thread_ids(app_instance) -> List[str]:
+    """从 PostgreSQL checkpointer 获取所有 thread_id"""
+    checkpointer = app_instance.checkpointer
+    conn = getattr(checkpointer, "conn", None)
+    if conn is None:
+        logger.warning("checkpointer 未暴露 conn，无法读取 checkpoints")
+        return []
+
+    query = """
+        SELECT DISTINCT thread_id
+        FROM checkpoints
+        ORDER BY thread_id
+    """
+    if hasattr(conn, "connection"):
+        async with conn.connection() as db_conn:
+            async with db_conn.cursor() as cur:
+                await cur.execute(query)
+                rows = await cur.fetchall()
+    else:
+        async with conn.cursor() as cur:
+            await cur.execute(query)
+            rows = await cur.fetchall()
+
+    return [thread_id for (thread_id,) in rows if thread_id]
+
+
+@app.on_event("startup")
+async def preload_sessions_from_db() -> None:
+    """启动时从数据库预加载会话列表"""
+    try:
+        app_instance = await get_app_with_checkpointer()
+        thread_ids = await fetch_checkpoint_thread_ids(app_instance)
+
+        for thread_id in thread_ids:
+            if thread_id in sessions:
+                continue
+            try:
+                config = {"configurable": {"thread_id": thread_id}}
+                state = await app_instance.aget_state(config)
+                if state and state.values:
+                    input_query = state.values.get("input_query") or ""
+                    name = (input_query[:50] + "...") if len(input_query) > 50 else input_query
+                    if not name:
+                        name = f"Session {thread_id[:8]}"
+                    created_at = state.metadata.get("created_at") or datetime.now().isoformat()
+                    sessions[thread_id] = {
+                        "thread_id": thread_id,
+                        "name": name,
+                        "created_at": created_at
+                    }
+            except Exception as e:
+                logger.warning(f"预加载会话 {thread_id} 失败: {e}")
+    except Exception as e:
+        logger.warning(f"启动预加载会话失败: {e}")
+
+
 # ========== 工具函数 ==========
 
 
@@ -406,66 +462,45 @@ async def list_sessions():
         # 获取 Graph 实例
         app_instance = await get_app_with_checkpointer()
 
-        # 从 checkpointer 获取所有 thread_id
-        all_sessions = {}
-
-        # 方法1: 遍历内存中的会话（与数据库同步）
-        for thread_id, data in sessions.items():
-            all_sessions[thread_id] = {
-                "thread_id": thread_id,
-                "name": data.get("name", f"Session {thread_id[:8]}"),
-                "created_at": data.get("created_at", datetime.now().isoformat())
-            }
-
-        # 方法2: 尝试从数据库获取更多会话
+        # 从数据库获取会话列表
+        all_sessions: Dict[str, Dict[str, Any]] = {}
         try:
-            checkpointer = app_instance.checkpointer
-            if hasattr(checkpointer, 'conn_pool'):
-                # 直接从数据库查询
-                query = """
-                    SELECT DISTINCT config->'configurable'->>'thread_id' as thread_id
-                    FROM checkpoints
-                    ORDER BY thread_id
-                """
-                pool = checkpointer.conn_pool
+            thread_ids = await fetch_checkpoint_thread_ids(app_instance)
+            for thread_id in thread_ids:
+                try:
+                    config = {"configurable": {"thread_id": thread_id}}
+                    state = await app_instance.aget_state(config)
 
-                async with pool.connection() as conn:
-                    async with conn.cursor() as cur:
-                        await cur.execute(query)
-                        rows = await cur.fetchall()
+                    if state and state.values:
+                        input_query = state.values.get("input_query") or ""
+                        name = (input_query[:50] + "...") if len(input_query) > 50 else input_query
+                        if not name:
+                            name = f"Session {thread_id[:8]}"
 
-                        for (thread_id,) in rows:
-                            if thread_id and thread_id not in all_sessions:
-                                try:
-                                    # 从 checkpoint 获取会话状态
-                                    config = {"configurable": {"thread_id": thread_id}}
-                                    state = await app_instance.aget_state(config)
-
-                                    if state and state.values:
-                                        # 获取输入查询作为会话名称
-                                        input_query = state.values.get("input_query", "")
-                                        name = (input_query[:50] + "...") if len(input_query) > 50 else input_query
-                                        if not name:
-                                            name = f"Session {thread_id[:8]}"
-
-                                        # 从 metadata 获取创建时间
-                                        created_at = state.metadata.get("created_at") or datetime.now().isoformat()
-
-                                        all_sessions[thread_id] = {
-                                            "thread_id": thread_id,
-                                            "name": name,
-                                            "created_at": created_at
-                                        }
-                                except Exception as e:
-                                    logger.warning(f"获取会话 {thread_id} 详情失败: {e}")
-                                    # 使用默认信息
-                                    all_sessions[thread_id] = {
-                                        "thread_id": thread_id,
-                                        "name": f"Session {thread_id[:8]}",
-                                        "created_at": datetime.now().isoformat()
-                                    }
+                        created_at = state.metadata.get("created_at") or datetime.now().isoformat()
+                        all_sessions[thread_id] = {
+                            "thread_id": thread_id,
+                            "name": name,
+                            "created_at": created_at
+                        }
+                except Exception as e:
+                    logger.warning(f"获取会话 {thread_id} 详情失败: {e}")
+                    all_sessions[thread_id] = {
+                        "thread_id": thread_id,
+                        "name": f"Session {thread_id[:8]}",
+                        "created_at": datetime.now().isoformat()
+                    }
         except Exception as e:
             logger.warning(f"从数据库获取会话列表失败: {e}")
+
+        # 合并内存会话（兜底）
+        for thread_id, data in sessions.items():
+            if thread_id not in all_sessions:
+                all_sessions[thread_id] = {
+                    "thread_id": thread_id,
+                    "name": data.get("name", f"Session {thread_id[:8]}"),
+                    "created_at": data.get("created_at", datetime.now().isoformat())
+                }
 
         # 转换为列表并按创建时间排序（最新的在前）
         all_sessions_list = list(all_sessions.values())
@@ -592,12 +627,18 @@ async def delete_session(thread_id: str):
     """
     删除会话
     """
+    try:
+        app_instance = await get_app_with_checkpointer()
+        if hasattr(app_instance, "checkpointer") and hasattr(app_instance.checkpointer, "adelete_thread"):
+            await app_instance.checkpointer.adelete_thread(thread_id)
+    except Exception as e:
+        logger.warning(f"删除会话 {thread_id} 的数据库记录失败: {e}")
+
     if thread_id in sessions:
         del sessions[thread_id]
-        logger.info(f"删除会话: {thread_id}")
-        return {"message": "会话已删除"}
 
-    raise HTTPException(status_code=404, detail="会话不存在")
+    logger.info(f"删除会话: {thread_id}")
+    return {"message": "会话已删除"}
 
 
 @app.post("/api/upload")
