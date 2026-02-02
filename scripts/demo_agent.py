@@ -148,64 +148,53 @@ async def run_agent(user_query: str, reset_thread: bool = False) -> Optional[dic
         print("\n提示: 请确保PostgreSQL数据库正在运行")
         return None
 
-    # 2. 准备状态（尝试复用上一轮状态）
+    # 2. 准备状态
     print("2. 准备状态...")
-
+    
     config = {
         "configurable": {
             "thread_id": "demo_thread"
         }
     }
 
-    # 尝试获取之前的checkpoint状态
-    try:
-        state_snapshot = await app.aget_state(config)
-        if state_snapshot and state_snapshot.values:
-            # 复用之前的状态，但需要清除表示"已完成"的字段
-            current_state = state_snapshot.values.copy()
-            current_state["input_query"] = user_query
-
-            # 清除上一轮执行产生的字段，让Graph重新执行完整流程
-            # 保留: log_summary（用于Planner上下文）、session_id
-            # 清除: final_summary, messages, plan, draft等执行相关字段
-            current_state.pop("final_summary", None)
-            current_state.pop("messages", None)
-            current_state.pop("plan", None)
-            current_state.pop("draft", None)
-            current_state.pop("status", False)
-            current_state.pop("advise", None)
-            current_state.pop("example", None)
-            current_state.pop("api_context_structured", None)
-            current_state.pop("gdal_doc", None)
-            current_state.pop("pyqgis_doc", None)
-            current_state.pop("execution_logs", None)
-            current_state.pop("screenshot_path", None)
-            current_state.pop("current_step_id", 0)
-            current_state.pop("is_completed", False)
-            current_state.pop("retry_count", 0)
-            # current_state["execution_reviewed"] = False
-
-            log_summary_preview = current_state.get('log_summary', 'None')
-            preview = log_summary_preview[:50] if log_summary_preview else 'None'
-            print(f"   ✅ 复用上一轮状态（已清理执行相关字段）")
-            print(f"   📝 log_summary: {preview}...")
-        else:
-            # 没有之前的状态，创建新状态
-            current_state = create_initial_state(
-                session_id="demo_session",
-                input_query=user_query
-            )
-            print(f"   ✅ 创建新状态")
-            print(f"   🆕 Session ID: {current_state['session_id']}")
-    except Exception as e:
-        import logging
-        logging.warning(f"获取之前状态失败，创建新状态: {e}")
+    if reset_thread:
+        # 情况A：第一轮运行，或者强制重置
+        # 需要完整的初始状态
+        print("   🆕 初始化新会话状态...")
         current_state = create_initial_state(
             session_id="demo_session",
             input_query=user_query
         )
-        print(f"   ✅ 创建新状态（获取历史状态失败）")
-        print(f"   🆕 Session ID: {current_state['session_id']}")
+    else:
+        # 情况B：后续轮次
+        # 1. 先检查是否存在历史状态（用于打印日志给用户看，不做逻辑依赖）
+        try:
+            state_snapshot = await app.aget_state(config)
+            if state_snapshot and state_snapshot.values:
+                log_summary = state_snapshot.values.get("log_summary", "None")
+                preview = log_summary[:50] if log_summary else 'None'
+                print(f"   ✅ 检测到历史会话")
+                print(f"   📝 上一轮摘要: {preview}...")
+                
+                # 【关键修正】这里只传递增量 (Delta)
+                # LangGraph 会自动将其 merge 到数据库中的旧状态
+                # 这样 history 字段（operator.add）就不会被自己重复叠加
+                current_state = {
+                    "input_query": user_query
+                }
+            else:
+                # 理论上不应该走到这里，除非数据库被清空了
+                print("   ⚠️ 未检测到历史状态，重新初始化...")
+                current_state = create_initial_state(
+                    session_id="demo_session",
+                    input_query=user_query
+                )
+        except Exception as e:
+            print(f"   ⚠️ 获取状态失败: {e}，将创建新状态")
+            current_state = create_initial_state(
+                session_id="demo_session",
+                input_query=user_query
+            )
 
     # 4. 执行Graph（支持HITL）
     print("\n" + "="*60)

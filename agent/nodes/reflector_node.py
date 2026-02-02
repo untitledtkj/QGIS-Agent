@@ -17,7 +17,8 @@ from langchain_openai import ChatOpenAI
 from agent.state import AgentState
 from agent.tools.database import save_execution_log, save_cookbook_entry
 from agent.tools.mcp_client import get_mcp_client
-
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langchain.messages import RemoveMessage  
 load_dotenv()
 
 # 配置日志
@@ -30,6 +31,59 @@ llm = ChatOpenAI(
     temperature=0.1
 )
 
+
+def _serialize_plan(plan: Any) -> Any:
+    """将 plan 序列化为可存储的结构。"""
+    if plan is None:
+        return None
+    if hasattr(plan, "model_dump"):
+        return plan.model_dump()
+    if hasattr(plan, "dict"):
+        return plan.dict()
+    return plan
+
+def _get_last_executor_message(messages) -> str:
+    """
+    提取 Executor 的最后一条自然语言总结消息
+    规则（基于真实日志）：
+    1. 从后往前遍历
+    2. 只处理 AIMessage
+    3. content 为 str，且不是 JSON 结构
+    4. 直接返回第一条命中的
+    """
+    if not messages:
+        return "无任务总结"
+
+    for msg in reversed(messages):
+
+        # 只关心 AIMessage
+        if not isinstance(msg, AIMessage):
+            continue
+
+        content = msg.content
+
+        # 1️⃣ 最理想情况：content 是字符串（你的最终总结就是这种）
+        if isinstance(content, str):
+            text = content.strip()
+            if text:
+                return text
+
+        # 2️⃣ 次优情况：content 是 list（多模态 / 工具返回）
+        elif isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(part.get("text", ""))
+                elif isinstance(part, str):
+                    parts.append(part)
+
+            text = "\n".join(parts).strip()
+
+            # 排除明显是 JSON 的工具结果
+            if text and not text.startswith("{"):
+                return text
+
+    return "无任务总结"
 
 async def reflector_node(state: AgentState) -> Dict[str, Any]:
     """
@@ -151,12 +205,12 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
 """
     
     try:
-        messages = [
+        reflector_messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_message)
         ]
         
-        response = await llm.ainvoke(messages)
+        response = await llm.ainvoke(reflector_messages)
         final_summary = response.content.strip()
         
         logger.info(f"生成总结: {final_summary[:100]}...")
@@ -300,22 +354,30 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     
     # 6. 状态清理（按照技术文档清理清单）
     # 保留的字段: log_summary, screenshot_path, input_query, is_completed
-    # 清理的字段: draft, plan, api_context_structured, execution_logs, code_history, 
+    # 清理的字段: draft, plan, api_context_structured, execution_logs, code_history,
     #            advise, retry_count, status, example, missing_deps, messages, quality_score
     logger.info("执行状态清理...")
-    
+
     combined_log_summary = (
         f"{prior_log_summary}\n\n{final_summary}" if prior_log_summary else final_summary
     )
-
+    history_entry = {
+        "input_query": input_query,
+        "plan": _serialize_plan(plan),
+        "executor_last_message": _get_last_executor_message(messages),
+        "final_summary": final_summary,
+    }
+    # TODO：清空状态之前，增加一个仅记录历史信息但不作为上下文的history字段（想让一个列表类型的字段每次都追加新内容，可以使用 Python 内置的 operator.add， steps_completed: Annotated[List[str], operator.add]
     cleaned_state = {
         # 保留字段
-        "final_summary": None,
+        "final_summary": final_summary,  # 保留当前任务的总结，供前端显示
         "log_summary": combined_log_summary,  # 用于下一轮Planner的上下文
         "screenshot_path": screenshot_path,
         "is_completed": is_completed,  # 待HITL实现后改为人工确认
-        
+        "history": [history_entry],
+
         # 清理的字段（重置为初始值）
+        "input_query": None,
         "draft": None,
         "plan": None,
         "api_context_structured": [],
@@ -328,7 +390,7 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
         "status": False,
         "example": None,
         "missing_deps": [],
-        "messages": [],
+        "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES)],
         "current_step_id": 0,
         "retry_attempts": 0,
         "quality_score": 0.0,  # 按文档要求清理

@@ -5,6 +5,7 @@ LangGraph State定义
 """
 
 from typing import TypedDict, List, Dict, Any, Optional, Annotated
+import operator
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 import uuid
@@ -80,6 +81,9 @@ class AgentState(TypedDict):
     is_completed: bool                # 用户人工认定的任务成功完成状态
     quality_score: float              # LLM对本次任务的价值评分
 
+    # ========== History 字段 ==========
+    history: Annotated[List[Dict[str, Any]], operator.add]  # 任务历史记录（追加式更新）
+
 
 # State初始化函数
 def create_initial_state(session_id: str, input_query: str) -> AgentState:
@@ -122,4 +126,7 @@ def create_initial_state(session_id: str, input_query: str) -> AgentState:
         final_summary=None,
         is_completed=None,
         quality_score=0.0,
+
+        # History字段
+        history=[],
     )

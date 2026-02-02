@@ -88,25 +88,21 @@ def _build_system_prompt(
     Returns:
         系统提示词字符串
     """
-    prompt = f"""你是一个专业的QGIS开发专家。你的任务是根据提供的API文档和任务描述，通过工具调用完成任务。
+    # 简化提示词，专注于让 agent 理解需要调用工具
+    prompt = f"""你是一个专业的QGIS开发专家。请通过调用可用的工具来完成以下任务。
 
-## 任务描述
+## 任务
 {task_description}
 
 ## 执行步骤
 {steps_text}
 
-## 可用的API文档
-{''.join(api_context_parts) if api_context_parts else '未提供API文档'}
+{f"## API 文档参考\\n{''.join(api_context_parts)}" if api_context_parts else ""}
 
-## 可用工具
-{tool_catalog}
-
-## 规则
-1. **优先使用工具**: 通过工具调用完成任务（例如数据导入和导出），只有在工具不足时才使用 execute_code
-2. **完成任务**: 根据任务和执行步骤，逐步完成任务
-3. **文件路径**: 路径必须符合Host OS格式
-4. **最终输出**: 当你认为任务完成，输出简短总结
+## 重要说明
+- 你必须通过调用工具来完成任务，不要只描述要做什么
+- 每完成一个步骤后，继续执行下一个步骤，直到所有步骤完成
+- 只有当你确认所有步骤都已实际完成后才停止
 """
 
     return prompt
@@ -126,11 +122,16 @@ async def _create_revise_agent(
     Returns:
         LangChain Agent 实例
     """
+    # 创建 agent
     agent = create_agent(
         model=llm,
         tools=tools,
         system_prompt=system_prompt,
     )
+
+    logger.info(f"create_agent 返回类型: {type(agent)}")
+    logger.info(f"可用工具数量: {len(tools)}")
+
     return agent
 
 
@@ -262,20 +263,64 @@ async def _executor_revise_node_async(state: AgentState) -> Dict[str, Any]:
         tool_catalog
     )
 
-    user_message = f"请完成以下任务: {plan.task}"
+    # 构建用户消息，明确要求调用工具
+    user_message = f"""请通过调用工具来完成以下QGIS任务: {plan.task}
+
+可用步骤:
+{steps_text}
+
+请开始执行：首先调用相应的工具来完成第一个步骤。
+"""
 
     logger.info("使用 create_agent 创建 agent 并执行任务...")
 
-    # 5. 创建 agent
-    agent = await _create_revise_agent(selected_tools, system_prompt)
+    # 5. 创建 executor (包含 agent)
+    executor = await _create_revise_agent(selected_tools, system_prompt)
 
-    # 6. 调用 agent.ainvoke() 执行任务
-    result = await agent.ainvoke({
-        "messages": [HumanMessage(content=user_message)]
-    })
+    logger.info(f"[DEBUG] Executor 类型: {type(executor)}")
+
+    # 6. 使用 astream() 执行任务，让 agent 完整执行所有步骤
+    logger.info(f"[DEBUG] 开始调用 executor.astream()...")
+    logger.info(f"[DEBUG] 用户消息: {user_message[:200]}")
+    final_result = None
+    step_count = 0
+    async for chunk in executor.astream(
+        {"messages": [HumanMessage(content=user_message)]},
+        stream_mode="values"
+    ):
+        step_count += 1
+        final_result = chunk
+        messages = chunk.get('messages', [])
+        logger.info(f"[DEBUG] Agent 步骤 {step_count}: 总共 {len(messages)} 条消息")
+
+        # 打印最后一条消息的详细信息
+        if messages:
+            last_msg = messages[-1]
+            msg_type = type(last_msg).__name__
+            content = str(last_msg.content)[:150] if hasattr(last_msg, 'content') and last_msg.content else ''
+            logger.info(f"[DEBUG]   最后一条消息类型: {msg_type}")
+            logger.info(f"[DEBUG]   内容: {content}")
+
+            # 检查是否有 tool_calls
+            if hasattr(last_msg, 'tool_calls') and last_msg.tool_calls:
+                tool_names = [tc.get('name', 'unknown') for tc in last_msg.tool_calls]
+                logger.info(f"[DEBUG]   工具调用: {tool_names}")
+    logger.info(f"[DEBUG] executor.astream() 完成，共 {step_count} 步")
 
     # 提取最终结果
-    agent_messages = result.get("messages", [])
+    if not final_result:
+        logger.error("Agent 未返回任何结果")
+        raise RuntimeError("Agent 未返回任何结果")
+
+    agent_messages = final_result.get("messages", [])
+    logger.info(f"[DEBUG] final_result 包含的键: {list(final_result.keys()) if isinstance(final_result, dict) else 'not a dict'}")
+    logger.info(f"Agent 共返回 {len(agent_messages)} 条消息")
+
+    # 打印所有消息以调试
+    for i, msg in enumerate(agent_messages):
+        content = msg.content if hasattr(msg, 'content') else str(msg)
+        logger.info(f"消息 {i+1}: {content[:200] if len(content) > 200 else content}")
+
     final_message = agent_messages[-1] if agent_messages else None
 
     if not final_message:
