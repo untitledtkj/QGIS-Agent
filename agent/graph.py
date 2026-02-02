@@ -228,7 +228,8 @@ async def create_checkpointer() -> AsyncPostgresSaver:
     
     pool = AsyncConnectionPool(
         conninfo=db_url,
-        max_size=10
+        max_size=10,
+        open=False
     )
     await pool.open()
     

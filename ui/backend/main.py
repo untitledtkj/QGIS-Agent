@@ -110,6 +110,10 @@ running_tasks: Dict[str, Dict[str, Any]] = {}
 # 存储会话列表
 sessions: Dict[str, Dict[str, Any]] = {}
 
+# 复用带 checkpointer 的 Graph，避免重复创建连接池
+_app_with_checkpointer: Optional[Any] = None
+_app_with_checkpointer_lock = asyncio.Lock()
+
 
 # ========== 依赖项 ==========
 
@@ -122,11 +126,16 @@ async def get_app_with_checkpointer():
     - interrupt_before: 在 human_review_node 前中断（计划审核）
     - interrupt_after: 在 executor_node 后中断（结果确认）
     """
-    return await get_graph(
-        with_checkpointer=True,
-        interrupt_before=["human_review_node"],
-        interrupt_after=["executor_node"]
-    )
+    global _app_with_checkpointer
+    if _app_with_checkpointer is None:
+        async with _app_with_checkpointer_lock:
+            if _app_with_checkpointer is None:
+                _app_with_checkpointer = await get_graph(
+                    with_checkpointer=True,
+                    interrupt_before=["human_review_node"],
+                    interrupt_after=["executor_node"]
+                )
+    return _app_with_checkpointer
 
 
 async def fetch_checkpoint_thread_ids(app_instance) -> List[str]:
@@ -183,6 +192,24 @@ async def preload_sessions_from_db() -> None:
                 logger.warning(f"预加载会话 {thread_id} 失败: {e}")
     except Exception as e:
         logger.warning(f"启动预加载会话失败: {e}")
+
+
+@app.on_event("shutdown")
+async def close_checkpointer_pool() -> None:
+    """关闭 AsyncConnectionPool，避免残留后台任务"""
+    global _app_with_checkpointer
+    app_instance = _app_with_checkpointer
+    if not app_instance:
+        return
+    try:
+        checkpointer = getattr(app_instance, "checkpointer", None)
+        conn = getattr(checkpointer, "conn", None)
+        if conn is not None:
+            await conn.close()
+    except Exception as e:
+        logger.warning(f"关闭 checkpointer 连接池失败: {e}")
+    finally:
+        _app_with_checkpointer = None
 
 
 # ========== 工具函数 ==========
