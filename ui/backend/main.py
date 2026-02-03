@@ -82,11 +82,21 @@ if SHARED_DIR.exists():
 # ========== 数据模型 ==========
 
 
+class LLMConfig(BaseModel):
+    """LLM 配置（可由前端覆盖）"""
+    api_base: Optional[str] = None
+    api_key: Optional[str] = None
+    model: Optional[str] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+
+
 class ChatRequest(BaseModel):
     """聊天请求"""
     message: str
     thread_id: Optional[str] = None
     files: list[str] = []
+    llm_config: Optional[LLMConfig] = None
 
 
 class ReviewRequest(BaseModel):
@@ -225,6 +235,99 @@ def format_sse_event(event_type: str, data: Dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+THINK_OPEN_TAGS = ("<think", "<thought")
+_MAX_OPEN_PREFIX = max(len(tag) for tag in THINK_OPEN_TAGS) - 1
+
+
+def init_thinking_parse_state() -> Dict[str, Any]:
+    """初始化思考标签解析状态"""
+    return {
+        "buffer": "",
+        "in_think": False,
+        "think_tag": None
+    }
+
+
+def split_thinking_from_content(
+    content: str,
+    state: Dict[str, Any]
+) -> tuple[list[str], list[str]]:
+    """从流式 content 中拆分思考内容与正式输出，并维护跨 chunk 状态"""
+    if not content:
+        return [], []
+
+    outputs: list[str] = []
+    thinkings: list[str] = []
+
+    buffer = f"{state.get('buffer', '')}{content}"
+    in_think = bool(state.get("in_think", False))
+    think_tag = state.get("think_tag")
+
+    while buffer:
+        if in_think:
+            close_tag = f"</{think_tag}>" if think_tag else "</think>"
+            close_index = buffer.find(close_tag)
+            if close_index != -1:
+                if close_index:
+                    thinkings.append(buffer[:close_index])
+                buffer = buffer[close_index + len(close_tag):]
+                in_think = False
+                think_tag = None
+                continue
+
+            tail_len = max(len(close_tag) - 1, 1)
+            if len(buffer) > tail_len:
+                thinkings.append(buffer[:-tail_len])
+                buffer = buffer[-tail_len:]
+            break
+
+        pos_think = buffer.find("<think")
+        pos_thought = buffer.find("<thought")
+        positions = [pos for pos in (pos_think, pos_thought) if pos != -1]
+        if not positions:
+            if len(buffer) > _MAX_OPEN_PREFIX:
+                outputs.append(buffer[:-_MAX_OPEN_PREFIX])
+                buffer = buffer[-_MAX_OPEN_PREFIX:]
+            break
+
+        pos = min(positions)
+        if pos > 0:
+            outputs.append(buffer[:pos])
+
+        buffer = buffer[pos:]
+        tag_end = buffer.find(">")
+        if tag_end == -1:
+            break
+
+        tag_text = buffer[:tag_end + 1]
+        if tag_text.startswith("<thought"):
+            think_tag = "thought"
+        else:
+            think_tag = "think"
+
+        in_think = True
+        buffer = buffer[tag_end + 1:]
+
+    state["buffer"] = buffer
+    state["in_think"] = in_think
+    state["think_tag"] = think_tag
+    return outputs, thinkings
+
+
+def flush_thinking_buffer(state: Dict[str, Any]) -> tuple[list[str], list[str]]:
+    """在流结束时输出残留内容"""
+    buffer = state.get("buffer") or ""
+    if not buffer:
+        return [], []
+
+    if state.get("in_think"):
+        state["buffer"] = ""
+        return [], [buffer]
+
+    state["buffer"] = ""
+    return [buffer], []
+
+
 def build_execution_summary(messages: list, max_items: int = 1) -> str:
     """构建去重后的执行摘要"""
     summary_lines = []
@@ -274,6 +377,7 @@ async def stream_agent_execution(
         # 用于跟踪节点状态
         current_node = None
         nodes_completed = []
+        thinking_state = init_thinking_parse_state()
 
         # 执行 Agent 并流式推送事件
         async for event in app.astream_events(
@@ -307,16 +411,40 @@ async def stream_agent_execution(
                     "timestamp": datetime.now().isoformat()
                 })
 
-            # 消息事件
+            # 消息事件 - 支持 thinking 和 output
             elif event_type == "on_chat_model_stream":
                 chunk = event_data.get("chunk", {})
-                content = chunk.content if hasattr(chunk, "content") else ""
-
-                if content:
-                    yield format_sse_event("message_delta", {
-                        "content": content,
+                
+                # 处理思考内容（reasoning_content）- 某些模型（如 o1 系列）支持
+                reasoning = chunk.reasoning_content if hasattr(chunk, 'reasoning_content') else None
+                if reasoning:
+                    yield format_sse_event("thinking", {
+                        "content": reasoning,
                         "timestamp": datetime.now().isoformat()
                     })
+                
+                # 处理正式输出
+                content = chunk.content if hasattr(chunk, 'content') else ""
+                if content:
+                    outputs, thinkings = split_thinking_from_content(content, thinking_state)
+                    if reasoning:
+                        thinkings = []
+
+                    for thinking in thinkings:
+                        if not thinking:
+                            continue
+                        yield format_sse_event("thinking", {
+                            "content": thinking,
+                            "timestamp": datetime.now().isoformat()
+                        })
+
+                    for output in outputs:
+                        if not output:
+                            continue
+                        yield format_sse_event("output", {
+                            "content": output,
+                            "timestamp": datetime.now().isoformat()
+                        })
 
             # 检查是否有错误
             elif event_type == "on_chain_error":
@@ -329,6 +457,22 @@ async def stream_agent_execution(
 
         # ================= CLI 同款中断判定 =================
         logger.info("[SSE] 流结束，使用状态驱动判定是否中断")
+
+        remaining_outputs, remaining_thinkings = flush_thinking_buffer(thinking_state)
+        for thinking in remaining_thinkings:
+            if not thinking:
+                continue
+            yield format_sse_event("thinking", {
+                "content": thinking,
+                "timestamp": datetime.now().isoformat()
+            })
+        for output in remaining_outputs:
+            if not output:
+                continue
+            yield format_sse_event("output", {
+                "content": output,
+                "timestamp": datetime.now().isoformat()
+            })
 
         final_state = await app.aget_state(config)
         state_values = final_state.values
@@ -754,6 +898,10 @@ async def chat_stream(request: ChatRequest):
             "input_query": request.message
         }
 
+        # LLM 配置覆盖（前端传入则优先使用）
+        if request.llm_config:
+            input_delta["llm_config"] = request.llm_config.model_dump(exclude_none=True)
+
         # 【修正点 2】: 处理“脏状态” (可选)
         # 如果你担心上一轮任务崩溃导致状态没清理干净 (Reflector没跑)，
         # 可以在开始新任务前，强制重置某些覆盖型字段。
@@ -895,6 +1043,7 @@ async def resume_execution(thread_id: str):
             })
 
             # 继续执行并流式推送事件
+            thinking_state = init_thinking_parse_state()
             async for event in app_instance.astream_events(
                 None,  # None 表示从当前状态继续
                 config=config,
@@ -924,16 +1073,40 @@ async def resume_execution(thread_id: str):
                         "timestamp": datetime.now().isoformat()
                     })
 
-                # 消息事件
+                # 消息事件 - 支持 thinking 和 output
                 elif event_type == "on_chat_model_stream":
                     chunk = event_data.get("chunk", {})
-                    content = chunk.content if hasattr(chunk, "content") else ""
-
-                    if content:
-                        yield format_sse_event("message_delta", {
-                            "content": content,
+                    
+                    # 处理思考内容（reasoning_content）- 如果模型支持
+                    reasoning = chunk.reasoning_content if hasattr(chunk, 'reasoning_content') else None
+                    if reasoning:
+                        yield format_sse_event("thinking", {
+                            "content": reasoning,
                             "timestamp": datetime.now().isoformat()
                         })
+                    
+                    # 处理正式输出
+                    content = chunk.content if hasattr(chunk, 'content') else ""
+                    if content:
+                        outputs, thinkings = split_thinking_from_content(content, thinking_state)
+                        if reasoning:
+                            thinkings = []
+
+                        for thinking in thinkings:
+                            if not thinking:
+                                continue
+                            yield format_sse_event("thinking", {
+                                "content": thinking,
+                                "timestamp": datetime.now().isoformat()
+                            })
+
+                        for output in outputs:
+                            if not output:
+                                continue
+                            yield format_sse_event("output", {
+                                "content": output,
+                                "timestamp": datetime.now().isoformat()
+                            })
 
                 # 检查是否有错误
                 elif event_type == "on_chain_error":
@@ -946,6 +1119,22 @@ async def resume_execution(thread_id: str):
 
             # ================= CLI 同款中断判定 =================
             logger.info("[Resume] 流结束，使用状态驱动判定是否中断")
+
+            remaining_outputs, remaining_thinkings = flush_thinking_buffer(thinking_state)
+            for thinking in remaining_thinkings:
+                if not thinking:
+                    continue
+                yield format_sse_event("thinking", {
+                    "content": thinking,
+                    "timestamp": datetime.now().isoformat()
+                })
+            for output in remaining_outputs:
+                if not output:
+                    continue
+                yield format_sse_event("output", {
+                    "content": output,
+                    "timestamp": datetime.now().isoformat()
+                })
 
             final_state = await app_instance.aget_state(config)
             state_values = final_state.values

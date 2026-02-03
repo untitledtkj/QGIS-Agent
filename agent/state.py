@@ -53,6 +53,7 @@ class AgentState(TypedDict):
     # ========== 基础输入 ==========
     input_query: str  # 用户的原始地理处理需求
     session_id: str   # 会话ID（用于数据隔离）
+    llm_config: Optional[Dict[str, Any]]  # LLM配置（可由前端覆盖）
     
     # ========== Planner Node 字段 ==========
     log_summary: Optional[str]        # 之前轮次的任务执行总结
@@ -86,7 +87,7 @@ class AgentState(TypedDict):
 
 
 # State初始化函数
-def create_initial_state(session_id: str, input_query: str) -> AgentState:
+def create_initial_state(session_id: str, input_query: str, llm_config: Optional[Dict[str, Any]] = None) -> AgentState:
     """
     创建初始状态
     
@@ -102,6 +103,9 @@ def create_initial_state(session_id: str, input_query: str) -> AgentState:
         input_query=input_query,
         session_id=session_id if session_id else str(uuid.uuid4()),
         
+        # LLM配置
+        llm_config=llm_config,
+
         # Planner字段
         log_summary=None,
         advise=None,

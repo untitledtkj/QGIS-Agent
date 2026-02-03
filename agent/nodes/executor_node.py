@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.tools import BaseTool
-from langchain_openai import ChatOpenAI
+from agent.llm import create_llm
 
 from agent.state import AgentState, StepContext
 from agent.tools.mcp_client import get_mcp_client
@@ -24,11 +24,8 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 创建 LLM 实例
-llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL_NAME", "deepseek-chat"),
-    temperature=0.1
-)
+def _get_llm(state: AgentState):
+    return create_llm(state.get("llm_config"))
 
 
 def _filter_tools_by_selection(
@@ -109,6 +106,7 @@ def _build_system_prompt(
 
 
 async def _create_revise_agent(
+    llm,
     tools: List[BaseTool],
     system_prompt: str
 ):
@@ -215,6 +213,7 @@ async def _executor_revise_node_async(state: AgentState) -> Dict[str, Any]:
     api_context_structured = state.get("api_context_structured", [])
     messages = state.get("messages", [])
     tool_selection = state.get("tool_selection")  # 工具选择范围
+    llm = _get_llm(state)
 
     if not plan:
         logger.error("未找到执行计划")
@@ -275,7 +274,7 @@ async def _executor_revise_node_async(state: AgentState) -> Dict[str, Any]:
     logger.info("使用 create_agent 创建 agent 并执行任务...")
 
     # 5. 创建 executor (包含 agent)
-    executor = await _create_revise_agent(selected_tools, system_prompt)
+    executor = await _create_revise_agent(llm, selected_tools, system_prompt)
 
     logger.info(f"[DEBUG] Executor 类型: {type(executor)}")
 

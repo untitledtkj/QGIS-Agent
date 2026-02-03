@@ -7,13 +7,12 @@ Planner Node - 规划器节点
 from typing import Dict, Any
 import asyncio
 import logging
-import os
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from jinja2 import Template
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from agent.llm import create_llm
 
 from agent.state import AgentState, Plan, Step
 from agent.tools.mcp_client import get_mcp_client
@@ -37,11 +36,8 @@ class PlannerOutput(BaseModel):
         description="元数据，包含iteration和has_example_reference等信息"
     )
 
-# 创建LLM实例（使用JSON模式以确保兼容性）
-llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL_NAME", "deepseek-chat"),
-    temperature=0.1
-).bind(response_format={"type": "json_object"})
+def _get_llm(state: AgentState):
+    return create_llm(state.get("llm_config")).bind(response_format={"type": "json_object"})
 
 # 定义Query Rewriting模板
 QUERY_REWRITE_TEMPLATE = Template("""请将以下信息综合成一个清晰的GIS任务描述，用于检索相似案例。
@@ -144,6 +140,7 @@ async def planner_node(state: AgentState) -> Dict[str, Any]:
     logger.info("=" * 60)
     
     session_id = state["session_id"]
+    llm = _get_llm(state)
     input_query = state["input_query"]
     advise = state.get("advise")
     log_summary = state.get("log_summary")

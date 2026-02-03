@@ -12,7 +12,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
-from langchain_openai import ChatOpenAI
+from agent.llm import create_llm
 
 from agent.state import AgentState
 from agent.tools.database import save_execution_log, save_cookbook_entry
@@ -25,11 +25,8 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 创建LLM实例
-llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL_NAME", "deepseek-chat"),
-    temperature=0.1
-)
+def _get_llm(state: AgentState):
+    return create_llm(state.get("llm_config"))
 
 
 def _serialize_plan(plan: Any) -> Any:
@@ -108,6 +105,7 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
     logger.info("=" * 60)
     
     session_id = state["session_id"]
+    llm = _get_llm(state)
     input_query = state["input_query"]
     prior_log_summary = state.get("log_summary")
     plan = state.get("plan")

@@ -6,11 +6,10 @@ API RAG Node - API RAG检索节点
 
 from typing import Dict, Any, List
 import logging
-import os
 import json
 from dotenv import load_dotenv
 
-from langchain_openai import ChatOpenAI
+from agent.llm import create_llm
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from agent.state import AgentState, RelevantDoc, StepContext
@@ -27,11 +26,8 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 创建LLM实例
-llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL_NAME", "deepseek-chat"),
-    temperature=0.1
-)
+def _get_llm(state: AgentState):
+    return create_llm(state.get("llm_config"))
 
 
 
@@ -57,6 +53,7 @@ async def api_rag_node(state: AgentState) -> Dict[str, Any]:
     logger.info("=" * 60)
     
     session_id = state["session_id"]
+    llm = _get_llm(state)
     plan = state.get("plan")
     
     if not plan:
