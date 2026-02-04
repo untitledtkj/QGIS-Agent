@@ -303,6 +303,15 @@
         <strong>执行摘要：</strong>
         <pre class="mt-2 text-sm whitespace-pre-wrap">{{ executionSummary }}</pre>
       </div>
+      <div class="mt-4">
+        <label class="block text-sm mb-2">若任务未完成，请补充失败原因（可选）：</label>
+        <el-input
+          v-model="resultFeedback"
+          type="textarea"
+          :rows="3"
+          placeholder="例如：图层未加载成功、字段名不一致、结果与预期不符..."
+        />
+      </div>
       <p class="text-sm text-dark-textSecondary">
         Reflector 将根据您的确认生成相应的总结和经验归档。
       </p>
@@ -342,6 +351,7 @@ const inputMessage = ref('')
 const reviewModalVisible = ref(false)
 const resultModalVisible = ref(false)
 const reviewAdvise = ref('')
+const resultFeedback = ref('')
 const isDragOver = ref(false)
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const screenshotTime = ref('暂无')
@@ -721,6 +731,7 @@ function handleSSEEvent(event: string, data: any) {
       isStreamingMessage = false // 结束流式消息
       isStreamingThinking = false
       chatStore.setExecutionResult(data)
+      resultFeedback.value = ''
       resultModalVisible.value = true
       chatStore.setExecuting(false)
       refreshScreenshotFromState()
@@ -730,7 +741,14 @@ function handleSSEEvent(event: string, data: any) {
       isStreamingThinking = false
       const finalSummary = data.summary || ''
       if (finalSummary) {
-        chatStore.addAssistantMessage(`🎉 任务完成！\n\n${finalSummary}`)
+        const lastAssistant = [...messages.value].reverse().find((msg) => msg.role === 'assistant')
+        const lastContent = lastAssistant?.content || ''
+        const alreadyStreamed = lastContent.trim() === finalSummary.trim()
+          || lastContent.trim().endsWith(finalSummary.trim())
+
+        if (!alreadyStreamed) {
+          chatStore.addAssistantMessage(`🎉 任务完成！\n\n${finalSummary}`)
+        }
       } else {
         chatStore.addSystemMessage('🎉 任务完成！')
       }
@@ -818,10 +836,13 @@ async function handleResultConfirm(isCompleted: boolean) {
   if (!currentThreadId.value) return
 
   try {
-    await confirmResult(currentThreadId.value, isCompleted)
+    const feedback = isCompleted ? undefined : resultFeedback.value.trim() || undefined
+    await confirmResult(currentThreadId.value, isCompleted, feedback)
     resultModalVisible.value = false
     chatStore.addSystemMessage(isCompleted ? '✅ 确认任务成功，继续反思' : '❌ 确认任务失败，继续反思')
     chatStore.setExecuting(true)
+
+    resultFeedback.value = ''
 
     // 重置流式状态
     resetStreamingState()

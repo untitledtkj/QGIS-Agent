@@ -128,10 +128,15 @@ export const reviewPlan = (thread_id: string, approved: boolean, advise?: string
 /**
  * 确认执行结果
  */
-export const confirmResult = (thread_id: string, is_completed: boolean): Promise<any> => {
+export const confirmResult = (
+  thread_id: string,
+  is_completed: boolean,
+  user_feedback?: string
+): Promise<any> => {
   return api.post('/confirm-result', {
     thread_id,
-    is_completed
+    is_completed,
+    user_feedback
   })
 }
 

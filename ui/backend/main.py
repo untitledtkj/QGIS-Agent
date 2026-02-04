@@ -54,9 +54,11 @@ logger = logging.getLogger(__name__)
 # 配置
 WEB_UI_HOST = os.getenv("WEB_UI_HOST", "0.0.0.0")
 WEB_UI_PORT = int(os.getenv("WEB_UI_PORT", "9000"))
-UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 SHARED_DIR = _project_root / "shared"
+UPLOAD_DIR = Path(
+    os.getenv("UPLOAD_DIR", str(SHARED_DIR / "upload"))
+)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # 创建 FastAPI 应用
 app = FastAPI(
@@ -77,6 +79,12 @@ app.add_middleware(
 # 静态资源：共享目录（截图、输出等）
 if SHARED_DIR.exists():
     app.mount("/shared", StaticFiles(directory=str(SHARED_DIR)), name="shared")
+
+# 静态资源：前端构建产物（/assets/*）
+_frontend_dir = Path(__file__).parent / "frontend"
+_frontend_assets_dir = _frontend_dir / "assets"
+if _frontend_assets_dir.exists():
+    app.mount("/assets", StaticFiles(directory=str(_frontend_assets_dir)), name="frontend-assets")
 
 
 # ========== 数据模型 ==========
@@ -991,6 +999,7 @@ class ResultConfirmRequest(BaseModel):
     """执行结果确认请求"""
     thread_id: str
     is_completed: bool  # True=成功, False=失败
+    user_feedback: Optional[str] = None
 
 
 @app.post("/api/confirm-result")
@@ -1005,10 +1014,22 @@ async def confirm_result(request: ResultConfirmRequest):
         app_instance = await get_app_with_checkpointer()
         config = {"configurable": {"thread_id": request.thread_id}}
 
-        # 更新状态，设置 is_completed
-        await app_instance.aupdate_state(config, {"is_completed": request.is_completed})
+        feedback = None
+        if not request.is_completed:
+            feedback = (request.user_feedback or "").strip() or None
 
-        logger.info(f"结果确认: {'成功' if request.is_completed else '失败'} - {request.thread_id}")
+        # 更新状态，设置 is_completed 与 user_feedback
+        await app_instance.aupdate_state(
+            config,
+            {
+                "is_completed": request.is_completed,
+                "user_feedback": feedback
+            }
+        )
+
+        logger.info(
+            f"结果确认: {'成功' if request.is_completed else '失败'} - {request.thread_id}"
+        )
 
         return {
             "status": "success",

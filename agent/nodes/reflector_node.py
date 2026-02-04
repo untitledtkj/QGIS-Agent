@@ -12,6 +12,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
+from jinja2 import Template
 from agent.llm import create_llm
 
 from agent.state import AgentState
@@ -178,7 +179,8 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
         detail_info += f"\n变量: {', '.join(sorted(variable_names))}"
     
     # 调用LLM生成总结
-    system_prompt = f"""你是一个专业的GIS任务分析专家。请分析以下任务执行情况，生成简洁的总结报告。
+    system_prompt_template = Template(
+        """你是一个专业的GIS任务分析专家。请分析以下任务执行情况，生成简洁的总结报告。
 
 总结应包含:
 1. 任务完成情况（成功/失败）
@@ -187,20 +189,33 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
 4. 遇到的问题（如果有）
 5. 经验教训（如果有）
 
-请用简洁的中文回答，不超过300字。{detail_info if detail_info else ''}
+请用简洁的中文回答，不超过300字。{% if detail_info %}{{ detail_info }}{% endif %}
 """
-    
-    user_message = f"""
-任务需求: {input_query}
+    )
+    system_prompt = system_prompt_template.render(detail_info=detail_info)
 
-执行计划: {plan.task if plan else '无计划'}
+    user_message_template = Template(
+        """
+任务需求: {{ input_query }}
+
+执行计划: {{ plan_task }}
 
 执行日志:
-{log_summary_text}
+{{ log_summary_text }}
 
-总步骤数: {total_steps}
-执行结果: {"成功" if is_success else "失败"}
+总步骤数: {{ total_steps }}
+执行结果: {{ "成功" if is_success else "失败" }}
+{% if not is_success %}用户认为的失败原因: {{ user_feedback }}{% endif %}
 """
+    )
+    user_message = user_message_template.render(
+        input_query=input_query,
+        plan_task=plan.task if plan else "无计划",
+        log_summary_text=log_summary_text,
+        total_steps=total_steps,
+        is_success=is_success,
+        user_feedback=state.get("user_feedback", "无反馈"),
+    )
     
     try:
         reflector_messages = [
@@ -392,6 +407,7 @@ async def reflector_node(state: AgentState) -> Dict[str, Any]:
         "current_step_id": 0,
         "retry_attempts": 0,
         "quality_score": 0.0,  # 按文档要求清理
+        "user_feedback": None,
     }
     
     # 保存最终日志

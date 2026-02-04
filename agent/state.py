@@ -81,6 +81,7 @@ class AgentState(TypedDict):
     screenshot_path: Optional[str]    # 最新生成的截图文件路径
     is_completed: bool                # 用户人工认定的任务成功完成状态
     quality_score: float              # LLM对本次任务的价值评分
+    user_feedback: Optional[str]      # 用户对任务失败的反馈意见
 
     # ========== History 字段 ==========
     history: Annotated[List[Dict[str, Any]], operator.add]  # 任务历史记录（追加式更新）

@@ -53,6 +53,7 @@ export interface ReviewRequest {
 export interface ResultConfirmRequest {
   thread_id: string
   is_completed: boolean
+  user_feedback?: string
 }
 
 export interface SessionCreateRequest {
