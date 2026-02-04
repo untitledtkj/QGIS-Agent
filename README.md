@@ -1,6 +1,6 @@
 # QGIS Agent v2
 
-> 基于自然语言交互的 QGIS 自动化 Agent，通过 AI Agent 自动改进的 QGIS-MCP 完成 API 检索与地理数据处理任务
+> 基于自然语言交互的 QGIS 自动化 Agent，通过 AI Agent 基于改进的 QGIS-MCP 完成 API 检索与地理数据处理任务
 
 [![Python](https://img.shields.io/badge/Python-3.12+-blue.svg)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-1.0+-green.svg)](https://github.com/langchain-ai/langgraph)

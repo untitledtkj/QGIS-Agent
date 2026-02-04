@@ -72,3 +72,5 @@ desktop.ini
 # --- Docker ---
 .docker-compose.override.yml
 
+# langsmith
+agent/observability.py
