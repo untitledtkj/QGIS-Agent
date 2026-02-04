@@ -10,9 +10,9 @@
 
 ### 🧠 智能规划与执行
 - **自然语言交互**: 用中文描述任务，Agent 自动理解并生成执行计划
-- **多阶段工作流**: 意图识别 → RAG 检索 → 自动执行 → 知识沉淀
+- **多阶段工作流**: 意图识别 → RAG 检索 → 自动执行 → 总结与知识沉淀
 - **人工审核 (HITL)**: 关键步骤前暂停，等待人工确认后继续
-- **上下文管理**: 压缩智能体执行信息，使用简短的总结内容作为之前任务的回顾
+- **上下文管理**: 压缩智能体执行节点信息，使用总结反思节点简短的总结内容作为之前任务的回顾
 
 ### 📚 精准 API 文档检索
 - **面向参数精度的 RAG**: 针对 LLM "知道调什么 API 但常写错参数" 的痛点，设计了二次检索与校验机制
@@ -110,6 +110,7 @@ UPLOAD_DIR=./uploads
 3. **安装依赖**
 ```bash
 # 使用 uv (推荐)
+# uv安装-https://docs.astral.sh/uv/getting-started/installation/
 uv sync
 
 # 或使用 pip
@@ -126,9 +127,10 @@ docker-compose up -d postgres
 
 
 ### 启动项目
-#### 初始化数据库表
+#### 初始化数据库表与API文档入库
 ```bash
 uv run scripts/setup_database.py
+uv run scripts/import_gdal_docs.py
 ```
 
 #### 启动 FastAPI 后端
@@ -183,7 +185,7 @@ npm run build
 2. **HITL 审核**: 展示计划，等待用户确认
 3. **API RAG Node**: 检索 `QgsVectorLayer`, `QgsCoordinateTransformSystem` 等文档
 4. **Executor Node**: 生成并执行代码
-5. **Reflector Node**: 生成任务总结，自动归档到 Cookbook
+5. **Reflector Node**: 根据用户的判断生成任务总结，自动归档到 Cookbook
 
 ### 示例 2: 栅格数据处理
 
